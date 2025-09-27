@@ -1,4 +1,3 @@
-import subprocess
 import os
 # --- force git identity for service context (SYSTEM) ---
 os.environ.setdefault('GIT_AUTHOR_NAME',    'nkd3')
@@ -99,7 +98,7 @@ def _run_git(args, timeout=120):
     env.setdefault("GIT_ASKPASS", "echo")
     env.setdefault("SSH_ASKPASS", "echo")
     env.setdefault("GIT_PAGER", "cat")
-    p = _run_git_hidden(
+    p = subprocess.run(
         cmd,
         cwd=str(ROOT),
         env=env,
