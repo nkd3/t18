@@ -1,3 +1,9 @@
+import os
+# --- force git identity for service context (SYSTEM) ---
+os.environ.setdefault('GIT_AUTHOR_NAME',    'nkd3')
+os.environ.setdefault('GIT_AUTHOR_EMAIL',   'neelkanth.dwibedi@gmail.com')
+os.environ.setdefault('GIT_COMMITTER_NAME', 'nkd3')
+os.environ.setdefault('GIT_COMMITTER_EMAIL','neelkanth.dwibedi@gmail.com')
 # t18_autosync.py — one-way (local -> remote) push-only autosync
 # Runs completely hidden when launched via pythonw.exe
 import os, sys, time, subprocess, traceback, hashlib, threading
@@ -202,3 +208,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
