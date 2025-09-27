@@ -36,7 +36,7 @@ STATUS_DELETED = CFG.get("core", "status_deleted_value", fallback="Deleted")
 IGNORE_PATTERNS = [s.strip().lower() for s in CFG.get("ignore","patterns",fallback="").split(",") if s.strip()]
 
 DB_ID = CFG.get("notion","database_id")
-NTN_TOKEN = CFG.get("notion","integration_token")
+NTN_TOKEN = os.environ.get("T18_NOTION_TOKEN") or CFG.get("notion","integration_token")
 PROP_PATH = CFG.get("notion","prop_path", fallback="Path")
 PROP_SIZE = CFG.get("notion","prop_size", fallback="Size")
 PROP_MOD  = CFG.get("notion","prop_modified", fallback="Modified")
@@ -284,3 +284,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
