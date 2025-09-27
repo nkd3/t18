@@ -51,3 +51,8 @@ ops/*.local.ini
 *.zip
 *.gz
 *.lock
+/_quarantine_*/
+/teevra18/**
+**/*.env
+**/*.env.*
+**/teevra18.config.json
