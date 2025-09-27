@@ -1,0 +1,679 @@
+# -*- coding: utf-8 -*-
+# tools_watch_and_sync_notion.py  (resilient scan; immediate watcher + heartbeat; HTTP taps; schema-safe title)
+from __future__ import annotations
+
+# --- BOOT BEACON ---
+try:
+    from pathlib import Path as _P
+    _BOOT_LOG = _P(r"C:\T18\logs\watch_and_sync.log")
+    _BOOT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with _BOOT_LOG.open("a", encoding="utf-8", errors="ignore") as _f:
+        _f.write("BOOT: script import started\r\n")
+except Exception:
+    pass
+
+import os, sys, time, json, argparse, subprocess, logging, io, msvcrt, threading
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Iterable
+
+# ---------- HTTP wire taps (requests + httpx) ----------
+# requests tap
+try:
+    import requests
+    _REQ_ORIG = requests.Session.request
+    def _REQ_WRAP(self, method, url, *a, **kw):
+        if "api.notion.com" in str(url):
+            logging.info(f"[HTTP][{method}] {url}")
+            try:
+                resp = _REQ_ORIG(self, method, url, *a, **kw)
+                logging.info(f"[HTTP][{method}] -> {resp.status_code} {getattr(resp, 'reason', '')}")
+                body = getattr(resp, "text", "")
+                if body:
+                    logging.info("[HTTP][body<=2KB] " + body[:2048].replace("\r"," ").replace("\n"," "))
+                return resp
+            except Exception as e:
+                logging.exception(f"[HTTP][{method}] RAISED: {e}")
+                raise
+        return _REQ_ORIG(self, method, url, *a, **kw)
+    requests.Session.request = _REQ_WRAP
+    logging.info("[HTTP] requests tap installed")
+except Exception:
+    pass
+
+# httpx tap (covers libraries that use httpx)
+try:
+    import httpx
+    _HX_C_REQ  = httpx.Client.request
+    _HX_A_REQ  = httpx.AsyncClient.request
+    _HX_FUNC   = httpx.request
+
+    def _log_body(prefix, body):
+        if body:
+            logging.info(f"{prefix}[body<=2KB] " + body[:2048].replace("\r"," ").replace("\n"," "))
+
+    def _HX_WRAP_SYNC(self, method, url, *a, **kw):
+        if "api.notion.com" in str(url):
+            logging.info(f"[HTTPX][{method}] {url}")
+            try:
+                r = _HX_C_REQ(self, method, url, *a, **kw)
+                logging.info(f"[HTTPX][{method}] -> {r.status_code} {getattr(r, 'reason_phrase', '')}")
+                _log_body("[HTTPX] ", getattr(r, "text", ""))
+                return r
+            except Exception as e:
+                logging.exception(f"[HTTPX][{method}] RAISED: {e}")
+                raise
+        return _HX_C_REQ(self, method, url, *a, **kw)
+
+    async def _HX_WRAP_ASYNC(self, method, url, *a, **kw):
+        if "api.notion.com" in str(url):
+            logging.info(f"[AHTTPX][{method}] {url}")
+            try:
+                r = await _HX_A_REQ(self, method, url, *a, **kw)
+                logging.info(f"[AHTTPX][{method}] -> {r.status_code} {getattr(r, 'reason_phrase', '')}")
+                _log_body("[AHTTPX] ", getattr(r, "text", ""))
+                return r
+            except Exception as e:
+                logging.exception(f"[AHTTPX][{method}] RAISED: {e}")
+                raise
+        return await _HX_A_REQ(self, method, url, *a, **kw)
+
+    def _HX_WRAP_FUNC(method, url, *a, **kw):
+        if "api.notion.com" in str(url):
+            logging.info(f"[HTTPX-FUNC][{method}] {url}")
+            try:
+                r = _HX_FUNC(method, url, *a, **kw)
+                logging.info(f"[HTTPX-FUNC][{method}] -> {r.status_code} {getattr(r, 'reason_phrase', '')}")
+                _log_body("[HTTPX-FUNC] ", getattr(r, "text", ""))
+                return r
+            except Exception as e:
+                logging.exception(f"[HTTPX-FUNC][{method}] RAISED: {e}")
+                raise
+        return _HX_FUNC(method, url, *a, **kw)
+
+    httpx.Client.request      = _HX_WRAP_SYNC
+    httpx.AsyncClient.request = _HX_WRAP_ASYNC
+    httpx.request             = _HX_WRAP_FUNC
+    logging.info("[HTTPX] httpx taps installed")
+except Exception:
+    pass
+# -------------------------------------------------------
+
+from dotenv import load_dotenv
+from watchdog.observers import Observer  # Windows native
+from watchdog.events import FileSystemEventHandler, FileSystemEvent, FileMovedEvent
+from logging.handlers import RotatingFileHandler
+
+# -----------------------
+# Singleton
+# -----------------------
+_LOCK_PATH = r"C:\T18\.watcher.lock"
+try:
+    _lf = open(_LOCK_PATH, "a+")
+    msvcrt.locking(_lf.fileno(), msvcrt.LK_NBLCK, 1)
+except OSError:
+    sys.exit(0)
+
+# -----------------------
+# Logging
+# -----------------------
+_LOG_PATH = Path(r"C:\T18\logs\watch_and_sync.log")
+_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+try:
+    _LOG_PATH.touch(exist_ok=True)
+except Exception:
+    pass
+
+class _DropCaretFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = str(record.getMessage()).rstrip()
+        if not msg: return False
+        if msg == '^' or msg.strip(' ^') == '': return False
+        return True
+
+logger = logging.getLogger("t18.watcher")
+logger.setLevel(logging.INFO)
+if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+    fh = RotatingFileHandler(str(_LOG_PATH), maxBytes=1_000_000, backupCount=3, encoding="utf-8", delay=True)
+    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    fh.addFilter(_DropCaretFilter())
+    logger.addHandler(fh)
+
+for noisy in ("urllib3", "requests", "httpx"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+
+class _LogWriter(io.TextIOBase):
+    def write(self, s):
+        if not s: return 0
+        for line in str(s).splitlines():
+            line = line.rstrip()
+            if not line or line == '^' or line.strip(' ^') == '': continue
+            logger.info(line)
+        return len(s)
+    def flush(self): pass
+
+sys.stdout = _LogWriter()
+sys.stderr = _LogWriter()
+
+def _excepthook(etype, evalue, etb):
+    import traceback
+    logger.error("UNCAUGHT EXCEPTION: %s: %s", etype.__name__, evalue)
+    for ln in traceback.format_exception(etype, evalue, etb):
+        for l in ln.splitlines():
+            if l and l != '^' and l.strip(' ^'):
+                logger.error(l)
+sys.excepthook = _excepthook
+
+print("Watcher logging initialized; headless mode OK.")
+
+# -----------------------
+# Constants / Paths
+# -----------------------
+ROOT = Path(r"C:\T18")
+ENV_PATH = ROOT / ".env"
+
+NOTION_BASE = "https://api.notion.com/v1"
+NOTION_VERSION = "2022-06-28"
+
+IGNORE_DIR_PARTS = {".venv", ".git", "__pycache__", "logs", "data\\parquet", "data/parquet"}
+IGNORE_EXT = {".pyc", ".db", ".parquet", ".ico", ".png", ".jpg", ".jpeg", ".gif", ".pdf"}
+ALLOW_NAMES = {"README.md", "README_AUTODOC.md"}
+
+REQUEST_TIMEOUT = 30
+RETRY_MAX = 3
+RETRY_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
+GENTLE_RATE_LIMIT_SECONDS = 0.20
+HEARTBEAT_SECONDS = 60
+
+# Will be filled at runtime after DB check
+TITLE_PROP_NAME: str = "Path"  # default used when we create the DB
+
+# -----------------------
+# Utils
+# -----------------------
+def getenv_clean(key: str, default: str = "") -> str:
+    raw = os.getenv(key, default)
+    if raw is None: return ""
+    return raw.split("#", 1)[0].strip().strip('"').strip("'")
+
+def rel_path(p: Path) -> str:
+    try:
+        return str(p.relative_to(ROOT)).replace("\\", "/")
+    except Exception:
+        return str(p).replace("\\", "/")
+
+def is_ignored(p: Path) -> bool:
+    rp = rel_path(p).lower()
+    parts = rp.split("/")
+    if any(part in IGNORE_DIR_PARTS for part in parts): return True
+    if p.suffix.lower() in IGNORE_EXT and p.name not in ALLOW_NAMES: return True
+    return False
+
+def iso_utc(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="seconds")
+
+def git_tracked(rp: str) -> bool:
+    try:
+        res = subprocess.run(["git", "ls-files", "--error-unmatch", rp],
+                             cwd=str(ROOT), stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, check=False)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+def write_env_key(key: str, value: str) -> None:
+    text = ENV_PATH.read_text(encoding="utf-8") if ENV_PATH.exists() else ""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith(f"{key}="):
+            lines[i] = f"{key}={value}"
+            break
+    else:
+        lines.append(f"{key}={value}")
+    ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+# -----------------------
+# Notion client
+# -----------------------
+class NotionClient:
+    def __init__(self, token: str):
+        self.headers = {
+            "Authorization": f"Bearer {token}",
+            "Notion-Version": NOTION_VERSION,
+            "Content-Type": "application/json",
+        }
+    def _req(self, method: str, path: str, *, data: Optional[dict] = None) -> requests.Response:
+        url = f"{NOTION_BASE}{path}"
+        payload = None if data is None else json.dumps(data)
+        last_exc: Optional[Exception] = None
+        for attempt in range(RETRY_MAX):
+            try:
+                r = requests.request(method, url, headers=self.headers, data=payload, timeout=REQUEST_TIMEOUT)
+                if r.status_code in (429, 500, 502, 503, 504):
+                    time.sleep(RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS)-1)])
+                    continue
+                return r
+            except Exception as e:
+                last_exc = e
+                time.sleep(RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS)-1)])
+        if last_exc: raise last_exc
+        raise RuntimeError("Notion request failed with no response")
+
+    def users_me(self) -> dict:
+        r = self._req("GET", "/users/me")
+        if r.status_code != 200:
+            raise SystemExit(f"Token invalid or no access. /users/me -> {r.status_code} {r.text}")
+        return r.json()
+
+    def database_retrieve(self, database_id: str) -> dict:
+        r = self._req("GET", f"/databases/{database_id}")
+        if r.status_code != 200:
+            raise SystemExit(f"Failed to retrieve database {database_id}: {r.status_code} {r.text}")
+        return r.json()
+
+    def database_create(self, page_id: str, title: str, properties: dict) -> dict:
+        payload = {
+            "parent": {"type": "page_id", "page_id": page_id},
+            "title": [{"type": "text", "text": {"content": title}}],
+            "properties": properties,
+        }
+        r = self._req("POST", "/databases", data=payload)
+        if r.status_code not in (200, 201):
+            raise SystemExit(f"Create database failed: {r.status_code} {r.text}")
+        return r.json()
+
+    def database_query(self, database_id: str, filter_: dict | None = None, page_size: int = 100, start_cursor: Optional[str] = None) -> dict:
+        payload: dict = {"page_size": page_size}
+        if filter_:
+            payload["filter"] = filter_
+        if start_cursor:
+            payload["start_cursor"] = start_cursor
+        r = self._req("POST", f"/databases/{database_id}/query", data=payload)
+        if r.status_code != 200:
+            logger.warning("Notion query failed (%s): %s", r.status_code, r.text)
+            return {"results": [], "has_more": False}
+        return r.json()
+
+    def page_update(self, page_id: str, properties: dict) -> None:
+        r = self._req("PATCH", f"/pages/{page_id}", data={"properties": properties})
+        if r.status_code != 200:
+            logger.warning("Update failed for page %s: %s %s", page_id, r.status_code, r.text)
+
+    def page_create(self, database_id: str, properties: dict) -> None:
+        r = self._req("POST", "/pages", data={"parent": {"database_id": database_id}, "properties": properties})
+        if r.status_code not in (200, 201):
+            logger.warning("Create failed: %s %s", r.status_code, r.text)
+
+# -----------------------
+# Notion helpers
+# -----------------------
+def notion_detect_title_prop_name(notion: NotionClient, db_id: str) -> str:
+    db = notion.database_retrieve(db_id)
+    for name, prop in db.get("properties", {}).items():
+        if prop.get("type") == "title":
+            return name
+    raise SystemExit("Database has no title property")
+
+def notion_mark_dir_deleted_prefix(notion: NotionClient | None, db_id: str | None, dir_rel: str) -> None:
+    if notion is None or db_id is None:
+        return
+    try:
+        prefix = dir_rel.rstrip("/") + "/"
+        start_cursor = None
+        while True:
+            resp = notion.database_query(
+                database_id=db_id,
+                filter_={"property": TITLE_PROP_NAME, "title": {"contains": prefix}},
+                page_size=50,
+                start_cursor=start_cursor
+            )
+            results = resp.get("results", [])
+            if not results:
+                break
+            for page in results:
+                pid = page.get("id")
+                if pid:
+                    time.sleep(GENTLE_RATE_LIMIT_SECONDS)
+                    notion.page_update(pid, {"Status": {"select": {"name": "deleted"}}})
+            if not resp.get("has_more"):
+                break
+            start_cursor = resp.get("next_cursor")
+    except Exception as e:
+        logger.warning("notion_mark_dir_deleted_prefix error for %s: %s", dir_rel, e)
+
+def notion_create_database_if_needed(notion: NotionClient, page_id: str, db_id_existing: str | None) -> str:
+    global TITLE_PROP_NAME
+    if db_id_existing:
+        try:
+            notion.database_retrieve(db_id_existing)
+            TITLE_PROP_NAME = notion_detect_title_prop_name(notion, db_id_existing)
+            return db_id_existing
+        except SystemExit as e:
+            print(f"Warning: NOTION_DB_ID invalid; will create new DB. Detail: {e}")
+    props = {
+        "Path": {"title": {}},
+        "Size": {"number": {"format": "number"}},
+        "Modified": {"date": {}},
+        "Status": {"select": {"options": [{"name": "present", "color": "green"},
+                                          {"name": "deleted", "color": "red"}]}},
+        "GitTracked": {"checkbox": {}},
+    }
+    db = notion.database_create(page_id=page_id, title="T18 File Index", properties=props)
+    db_id = db["id"]
+    write_env_key("NOTION_DB_ID", db_id)
+    os.environ["NOTION_DB_ID"] = db_id
+    TITLE_PROP_NAME = "Path"
+    print(f"Created Notion database 'T18 File Index' -> {db_id}")
+    return db_id
+
+def notion_query_by_path(notion: NotionClient, db_id: str, path_value: str) -> Optional[str]:
+    resp = notion.database_query(
+        database_id=db_id,
+        filter_={"property": TITLE_PROP_NAME, "title": {"equals": path_value}},
+        page_size=1
+    )
+    results = resp.get("results", [])
+    return results[0]["id"] if results else None
+
+def notion_upsert_file(notion: NotionClient | None, db_id: str | None, p: Path) -> None:
+    if notion is None or db_id is None: return
+    try:
+        rp = rel_path(p)
+        if is_ignored(p) or not p.exists() or p.is_dir(): return
+        st = p.stat()
+        props = {
+            TITLE_PROP_NAME: {"title": [{"type": "text", "text": {"content": rp}}]},
+            "Size": {"number": int(st.st_size)},
+            "Modified": {"date": {"start": iso_utc(st.st_mtime)}},
+            "Status": {"select": {"name": "present"}},
+            "GitTracked": {"checkbox": git_tracked(rp)},
+        }
+        page_id = notion_query_by_path(notion, db_id, rp)
+        time.sleep(GENTLE_RATE_LIMIT_SECONDS)
+        if page_id:
+            notion.page_update(page_id, props)
+        else:
+            notion.page_create(db_id, props)
+    except Exception as e:
+        logger.warning("notion_upsert_file error for %s: %s", p, e)
+
+def notion_mark_deleted(notion: NotionClient | None, db_id: str | None, rel_path_value: str) -> None:
+    if notion is None or db_id is None: return
+    try:
+        page_id = notion_query_by_path(notion, db_id, rel_path_value)
+        time.sleep(GENTLE_RATE_LIMIT_SECONDS)
+        if not page_id: return
+        props = {"Status": {"select": {"name": "deleted"}}}
+        notion.page_update(page_id, props)
+    except Exception as e:
+        logger.warning("notion_mark_deleted error for %s: %s", rel_path_value, e)
+
+def notion_mark_prefix_deleted(notion: NotionClient | None, db_id: str | None, prefix_rel: str) -> None:
+    if notion is None or db_id is None: return
+    try:
+        cursor = None
+        while True:
+            resp = notion.database_query(
+                database_id=db_id,
+                filter_={"property": TITLE_PROP_NAME, "title": {"starts_with": prefix_rel}},
+                page_size=100,
+                start_cursor=cursor
+            )
+            results = resp.get("results", [])
+            if not results and not resp.get("has_more"):
+                break
+            for page in results:
+                notion.page_update(page["id"], {"Status": {"select": {"name": "deleted"}}})
+                time.sleep(GENTLE_RATE_LIMIT_SECONDS)
+            cursor = resp.get("next_cursor")
+            if not resp.get("has_more"):
+                break
+    except Exception as e:
+        logger.warning("notion_mark_prefix_deleted error for %s: %s", prefix_rel, e)
+
+def notion_list_present_paths(notion: NotionClient, db_id: str) -> Iterable[str]:
+    cursor = None
+    while True:
+        resp = notion.database_query(
+            database_id=db_id,
+            filter_={"property": "Status", "select": {"equals": "present"}},
+            page_size=100,
+            start_cursor=cursor
+        )
+        for page in resp.get("results", []):
+            props = page.get("properties", {})
+            title_list = props.get(TITLE_PROP_NAME, {}).get("title", [])
+            if title_list:
+                # Notion API guarantees plain_text on title rich text items
+                yield title_list[0].get("plain_text", "")
+        cursor = resp.get("next_cursor")
+        if not resp.get("has_more"):
+            break
+
+# -----------------------
+# Scan, Reconcile & Watch
+# -----------------------
+# Robust tree iterator that ignores disappearing paths mid-scan
+def iter_tree(root: Path):
+    stack = [root]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for entry in it:
+                    p = Path(entry.path)
+                    if entry.is_dir(follow_symlinks=False):
+                        yield p  # dir
+                        stack.append(p)
+                    else:
+                        yield p  # file
+        except (FileNotFoundError, PermissionError):
+            continue
+
+def full_scan_and_sync(notion: NotionClient | None, db_id: str | None) -> set[str]:
+    print("Initial scan...")
+    seen: set[str] = set()
+    count = 0
+
+    # Walk using os.walk with pruning; resilient to disappearing dirs/files
+    for root, dirs, files in os.walk(ROOT, topdown=True):
+        try:
+            pr = Path(root)
+            rel_parts = rel_path(pr).lower().split("/")
+            dirs[:] = [d for d in dirs
+                       if not any(part in IGNORE_DIR_PARTS for part in (rel_parts + [d]))]
+        except Exception:
+            continue
+
+        for name in files:
+            p = Path(root) / name
+            try:
+                if p.is_file() and not is_ignored(p):
+                    rp = rel_path(p)
+                    print(f"[SCAN] file: {p}")
+                    seen.add(rp)
+                    print(f"[NOTION] UPSERT (scan): {rp}")
+                    notion_upsert_file(notion, db_id, p)
+                    count += 1
+                    if count % 500 == 0:
+                        print(f"[SCAN] processed {count} files...")
+            except FileNotFoundError:
+                continue
+            except PermissionError:
+                logger.warning("scan skipped (perm): %s", p)
+            except Exception as e:
+                logger.warning("scan skipped (err): %s: %s", p, e)
+
+    print("Initial scan complete.")
+    return seen
+
+def reconcile_missing(notion: NotionClient | None, db_id: str | None, seen_paths: set[str]) -> None:
+    if notion is None or db_id is None: return
+    try:
+        print("[RECONCILE] start…")
+        for rp in notion_list_present_paths(notion, db_id):
+            if rp not in seen_paths:
+                notion_mark_deleted(notion, db_id, rp)
+        print("[RECONCILE] done.")
+    except Exception as e:
+        logger.warning("reconcile_missing error: %s", e)
+
+def sync_path(notion: NotionClient | None, db_id: str | None, p: Path) -> None:
+    try:
+        if p.is_file():
+            if not is_ignored(p):
+                notion_upsert_file(notion, db_id, p)
+        elif p.is_dir():
+            # iterate safely through the directory
+            for f in iter_tree(p):
+                if f.is_file() and not is_ignored(f):
+                    notion_upsert_file(notion, db_id, f)
+    except Exception as e:
+        logger.warning("sync_path error for %s: %s", p, e)
+
+class Handler(FileSystemEventHandler):
+    def __init__(self, notion: NotionClient | None, db_id: str | None) -> None:
+        self.notion = notion
+        self.db_id = db_id
+
+    def on_created(self, event: FileSystemEvent):
+        p = Path(event.src_path)
+        if event.is_directory:
+            print(f"[DEBUG] dir-created: {p}")
+            print(f"[NOTION] SYNC DIR: {rel_path(p)}")
+            sync_path(self.notion, self.db_id, p)
+            return
+        if is_ignored(p): return
+        print(f"[DEBUG] created: {p}")
+        print(f"[NOTION] UPSERT: {rel_path(p)}")
+        notion_upsert_file(self.notion, self.db_id, p)
+
+    def on_modified(self, event: FileSystemEvent):
+        if event.is_directory: return
+        p = Path(event.src_path)
+        if is_ignored(p): return
+        print(f"[DEBUG] modified: {p}")
+        print(f"[NOTION] UPSERT: {rel_path(p)}")
+        notion_upsert_file(self.notion, self.db_id, p)
+
+    def on_moved(self, event: FileMovedEvent):
+        src = Path(event.src_path)
+        dest = Path(event.dest_path)
+        if event.is_directory:
+            old_prefix = (rel_path(src).rstrip("/") + "/")
+            print(f"[DEBUG] dir-moved-from: {src}")
+            print(f"[NOTION] DELETE PREFIX: {old_prefix}")
+            notion_mark_prefix_deleted(self.notion, self.db_id, old_prefix)
+            print(f"[DEBUG] dir-moved-to:   {dest}")
+            print(f"[NOTION] SYNC DIR: {rel_path(dest)}")
+            sync_path(self.notion, self.db_id, dest)
+            return
+        if not is_ignored(src):
+            print(f"[DEBUG] moved-from: {src}")
+            print(f"[NOTION] DELETE: {rel_path(src)}")
+            notion_mark_deleted(self.notion, self.db_id, rel_path(src))
+        if not is_ignored(dest):
+            print(f"[DEBUG] moved-to:   {dest}")
+            print(f"[NOTION] UPSERT: {rel_path(dest)}")
+            notion_upsert_file(self.notion, self.db_id, dest)
+
+    def on_deleted(self, event: FileSystemEvent):
+        if event.is_directory:
+            d = Path(event.src_path)
+            rp = rel_path(d)
+            print(f"[DEBUG] dir-deleted: {d}")
+            print(f"[NOTION] DELETE DIR ROW (if any): {rp}")
+            notion_mark_deleted(self.notion, self.db_id, rp)
+            print(f"[NOTION] DELETE PREFIX: {rp}")
+            notion_mark_dir_deleted_prefix(self.notion, self.db_id, rp)
+            return
+        rp = rel_path(Path(event.src_path))
+        print(f"[DEBUG] deleted: {rp}")
+        print(f"[NOTION] DELETE: {rp}")
+        notion_mark_deleted(self.notion, self.db_id, rp)
+
+# -----------------------
+# Heartbeat
+# -----------------------
+def start_heartbeat():
+    def _beat():
+        while True:
+            time.sleep(HEARTBEAT_SECONDS)
+            print("Heartbeat: watcher alive.")
+    t = threading.Thread(target=_beat, name="t18-heartbeat", daemon=True)
+    t.start()
+
+# -----------------------
+# Main
+# -----------------------
+def main():
+    load_dotenv(ENV_PATH, override=True)
+    token   = getenv_clean("NOTION_TOKEN")
+    page_id = getenv_clean("NOTION_PAGE_ID")
+    db_id_existing = getenv_clean("NOTION_DB_ID") or None
+
+    print(f"[SANITY] ENV_PATH = {ENV_PATH}")
+    print(f"[SANITY] NOTION_TOKEN present? {'YES' if token else 'NO'}")
+    print(f"[SANITY] NOTION_PAGE_ID present? {'YES' if page_id else 'NO'}")
+    print(f"[SANITY] NOTION_DB_ID existing? {db_id_existing or 'NONE'}")
+
+    notion: NotionClient | None = None
+    db_id: str | None = None
+    global TITLE_PROP_NAME
+
+    if token and page_id:
+        try:
+            notion = NotionClient(token)
+            me = notion.users_me()
+            name = me.get("name") or me.get("bot", {}).get("owner", {}).get("user", {}).get("name")
+            print(f"Notion token OK. Connected as: {name or 'Notion Integration'}")
+            db_id = notion_create_database_if_needed(notion, page_id, db_id_existing)
+            # ensure title key in memory (for existing DBs with non-Path title)
+            TITLE_PROP_NAME = notion_detect_title_prop_name(notion, db_id)
+        except Exception as e:
+            print(f"Notion check failed (continuing without Notion; will still watch and log): {e}")
+            notion = None
+            db_id = None
+    else:
+        print("NOTION_TOKEN or NOTION_PAGE_ID missing; running in 'log-only' mode.")
+
+    parser = argparse.ArgumentParser(description="Watch C:\\T18 and sync to Notion database.")
+    parser.add_argument("--once", action="store_true", help="Do one full scan and exit.")
+    parser.add_argument("--reconcile", action="store_true", help="After full scan, mark Notion rows not present on disk as deleted.")
+    parser.add_argument("--noscan", action="store_true", help="Skip initial scan.")
+    args = parser.parse_args()
+
+    start_heartbeat()
+
+    if args.once:
+        seen = full_scan_and_sync(notion, db_id)
+        if args.reconcile:
+            reconcile_missing(notion, db_id, seen)
+        return
+
+    obs = Observer(timeout=0.2)
+    handler = Handler(notion, db_id)
+    obs.schedule(handler, str(ROOT), recursive=True)
+    obs.start()
+    print("Watching for changes... (Ctrl+C to stop if running in console)")
+
+    if not args.noscan:
+        # do initial scan in background so watch starts immediately
+        threading.Thread(
+            target=lambda: (lambda s: (reconcile_missing(notion, db_id, s)))(full_scan_and_sync(notion, db_id)),
+            daemon=True
+        ).start()
+    else:
+        print("Initial scan skipped (--noscan).")
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        obs.stop()
+        obs.join()
+
+if __name__ == "__main__":
+    main()

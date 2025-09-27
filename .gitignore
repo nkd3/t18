@@ -1,0 +1,38 @@
+# --- T18 autosync safety ignores ---
+/.venv/
+/logs/
+/__pycache__/
+*.pyc
+
+# Data & artifacts
+/data/
+/history/
+/parquet/
+*.db
+*.sqlite*
+*.parquet
+*.zip
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temp/lock/test files
+%LOG%
+\.watcher.lock
+WATCHER_DIAG.txt
+SYNC_TEST.md
+ZZZ/
+start_silent_test.vbs
+start_watcher.cmd
+start_watcher.vbs
+
+# local-only launchers with secrets
+start_t18_notion_env.vbs
+
+# quarantine old launchers
+start_watcher.cmd
+tools_watch_and_sync_notion.py
+tools/notion_watcher.py

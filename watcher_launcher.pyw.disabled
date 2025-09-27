@@ -1,0 +1,50 @@
+import subprocess, time
+from pathlib import Path
+
+ROOT = Path(r"C:\T18")
+PYW  = ROOT / r".venv\Scripts\pythonw.exe"
+TOOL = ROOT / "tools_watch_and_sync_notion.py"
+LOGS = ROOT / "logs"
+LOGS.mkdir(parents=True, exist_ok=True)
+LAUNCHER_LOG = LOGS / "launcher.log"
+
+def log(msg: str):
+    try:
+        with LAUNCHER_LOG.open("a", encoding="utf-8", errors="ignore") as f:
+            f.write(msg.rstrip() + "\r\n")
+    except Exception:
+        pass
+
+def run_bg(args):
+    return subprocess.Popen([str(PYW), str(TOOL), *args],
+                            cwd=str(ROOT),
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            creationflags=0x08000000)  # hidden
+
+def run_sync(args, timeout=None):
+    return subprocess.run([str(PYW), str(TOOL), *args],
+                          cwd=str(ROOT),
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL,
+                          creationflags=0x08000000,
+                          timeout=timeout)
+
+def main():
+    time.sleep(10)  # give network a moment
+    log("BOOT BEACON: launcher started")
+
+    try:
+        run_sync(["--once", "--reconcile"], timeout=60*30)
+        log("ONE-TIME SCAN+RECONCILE: done")
+    except Exception as e:
+        log(f"ONE-TIME SCAN+RECONCILE: failed: {e}")
+
+    try:
+        run_bg(["--noscan"])
+        log("WATCHER: started (--noscan)")
+    except Exception as e:
+        log(f"WATCHER: failed: {e}")
+
+if __name__ == "__main__":
+    main()

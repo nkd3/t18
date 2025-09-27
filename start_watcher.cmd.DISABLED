@@ -1,0 +1,13 @@
+@echo off
+setlocal
+set LOG=C:\T18\logs\launcher.log
+if not exist C:\T18\logs mkdir C:\T18\logs 2>nul
+echo [%date% %time%] Startup invoked>>"%LOG%"
+timeout /t 20 /nobreak >nul
+pushd C:\T18
+del /f /q C:\T18\.watcher.lock >nul 2>&1
+start "t18-watcher" /MIN "C:\T18\.venv\Scripts\python.exe" "C:\T18\tools_watch_and_sync_notion.py" --noscan
+echo [%date% %time%] Launched watcher (python.exe --noscan)>>"%LOG%"
+popd
+endlocal
+

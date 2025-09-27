@@ -1,0 +1,192 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+# --- EARLY BOOT BEACON: write ASAP, even under pythonw.exe ---
+try:
+    import os
+    from pathlib import Path as _P
+    _BOOT_LOG = _P(r"C:\T18\logs\watch_and_sync.log")
+    _BOOT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(_BOOT_LOG), "a", encoding="utf-8", errors="ignore") as _f:
+        _f.write("BOOT: script import started\r\n")
+except Exception:
+    pass
+# --- END EARLY BOOT BEACON ---
+
+import os, sys, time, json, argparse, subprocess, logging, io, msvcrt
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import requests
+from dotenv import load_dotenv
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler, FileSystemEvent
+from logging.handlers import RotatingFileHandler
+
+# --- Singleton FIRST, then logging (headless safe) ---
+_LOCK_PATH = r"C:\T18\.watcher.lock"
+try:
+    _lf = open(_LOCK_PATH, "a+")
+    msvcrt.locking(_lf.fileno(), msvcrt.LK_NBLCK, 1)
+except OSError:
+    sys.exit(0)
+
+_LOG_PATH = Path(r"C:\T18\logs\watch_and_sync.log")
+_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+try:
+    _LOG_PATH.touch(exist_ok=True)
+except Exception:
+    pass
+
+logger = logging.getLogger("t18.watcher")
+logger.setLevel(logging.INFO)
+if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+    fh = RotatingFileHandler(str(_LOG_PATH), maxBytes=1_000_000,
+                             backupCount=3, encoding="utf-8", delay=True)
+    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logger.addHandler(fh)
+
+class _LogWriter(io.TextIOBase):
+    def write(self, s):
+        s = (s or '').rstrip()
+        if s:
+            logger.info(s)
+        return len(s)
+    def flush(self): pass
+
+sys.stdout = _LogWriter()
+sys.stderr = _LogWriter()
+print("Watcher logging initialized; headless mode OK.")
+
+# -----------------------
+# Constants / Paths
+# -----------------------
+ROOT = Path(r"C:\T18")
+ENV_PATH = ROOT / ".env"
+LOG_PATH = _LOG_PATH
+
+NOTION_BASE = "https://api.notion.com/v1"
+NOTION_VERSION = "2022-06-28"
+
+IGNORE_DIR_PARTS = {".venv", ".git", "__pycache__", "logs", "data\\parquet", "data/parquet"}
+IGNORE_EXT = {".pyc", ".db", ".parquet", ".ico", ".png", ".jpg", ".jpeg", ".gif", ".pdf"}
+ALLOW_NAMES = {"README.md", "README_AUTODOC.md"}
+
+REQUEST_TIMEOUT = 30
+RETRY_MAX = 3
+RETRY_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
+GENTLE_RATE_LIMIT_SECONDS = 0.20
+
+# -----------------------
+# Utilities
+# -----------------------
+def getenv_clean(key: str, default: str = "") -> str:
+    raw = os.getenv(key, default)
+    if raw is None: return ""
+    return raw.split("#", 1)[0].strip().strip('"').strip("'")
+
+def require_env(var: str) -> str:
+    val = getenv_clean(var)
+    if not val or val.startswith("<PLACEHOLDER"):
+        print(f"ERROR: {var} is not set correctly in {ENV_PATH}")
+        sys.exit(2)
+    return val
+
+def rel_path(p: Path) -> str:
+    try:
+        return str(p.relative_to(ROOT)).replace("\\", "/")
+    except Exception:
+        return str(p).replace("\\", "/")
+
+def is_ignored(p: Path) -> bool:
+    rp = rel_path(p).lower()
+    parts = rp.split("/")
+    if any(part in IGNORE_DIR_PARTS for part in parts):
+        return True
+    if p.suffix.lower() in IGNORE_EXT and p.name not in ALLOW_NAMES:
+        return True
+    return False
+
+def iso_utc(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="seconds")
+
+def git_tracked(rp: str) -> bool:
+    try:
+        res = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", rp],
+            cwd=str(ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+# -----------------------
+# Notion API client
+# -----------------------
+class NotionClient:
+    def __init__(self, token: str):
+        self.headers = {
+            "Authorization": f"Bearer {token}",
+            "Notion-Version": NOTION_VERSION,
+            "Content-Type": "application/json",
+        }
+
+    def _req(self, method: str, path: str, *, data: Optional[dict] = None) -> requests.Response:
+        url = f"{NOTION_BASE}{path}"
+        payload = None if data is None else json.dumps(data)
+        for attempt in range(RETRY_MAX):
+            try:
+                r = requests.request(method, url, headers=self.headers, data=payload, timeout=REQUEST_TIMEOUT)
+                if r.status_code in (429, 500, 502, 503, 504):
+                    time.sleep(RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS)-1)])
+                    continue
+                return r
+            except Exception:
+                time.sleep(RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS)-1)])
+        raise RuntimeError("Notion API failed")
+
+    def users_me(self) -> dict:
+        r = self._req("GET", "/users/me")
+        if r.status_code != 200:
+            raise SystemExit(f"Token invalid /users/me -> {r.status_code} {r.text}")
+        return r.json()
+
+    def database_retrieve(self, database_id: str) -> dict:
+        r = self._req("GET", f"/databases/{database_id}")
+        if r.status_code != 200:
+            raise SystemExit(f"Failed to retrieve database {database_id}: {r.status_code} {r.text}")
+        return r.json()
+
+    def database_create(self, page_id: str, title: str, properties: dict) -> dict:
+        payload = {
+            "parent": {"type": "page_id", "page_id": page_id},
+            "title": [{"type": "text", "text": {"content": title}}],
+            "properties": properties,
+        }
+        r = self._req("POST", "/databases", data=payload)
+        if r.status_code not in (200, 201):
+            raise SystemExit(f"Create database failed: {r.status_code} {r.text}")
+        return r.json()
+
+    def database_query(self, database_id: str, filter_: dict, page_size: int = 1) -> dict:
+        payload = {"filter": filter_, "page_size": page_size}
+        r = self._req("POST", f"/databases/{database_id}/query", data=payload)
+        if r.status_code != 200:
+            raise SystemExit(f"Query failed: {r.status_code} {r.text}")
+        return r.json()
+
+    def page_update(self, page_id: str, properties: dict) -> None:
+        r = self._req("PATCH", f"/pages/{page_id}", data={"properties": properties})
+        if r.status_code != 200:
+            print(f"Update failed for page {page_id}: {r.status_code} {r.text}")
+
+    def page_create(self, database_id: str, properties: dict) -> None:
+        r = self._req("POST", "/pages", data={"parent": {"database_id": database_id}, "properties": properties})
+        if r.status_code not in (200, 201):
+            print(f"Create failed: {r.status_code} {r.text}")
+
+# (⬇️ You’d still need the DB ops, handler class, and main() function – same as before)

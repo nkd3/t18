@@ -1,0 +1,286 @@
+# -*- coding: utf-8 -*-
+"""
+Local-only watcher for C:\T18
+- Upsert files into Notion DB (Path unique key)
+- Mark deletions as Status=Deleted
+- Auto-commit/pull/push to GitHub
+- Single instance via lock file
+- Hidden via pythonw.exe (no console)
+- NEW: Optional IPv4-only mode via config [notion] force_ipv4=true or env T18_FORCE_IPV4=1
+"""
+
+import os, sys, json, time, threading, subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+from dateutil import tz
+import portalocker
+
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+import configparser
+
+# ----------------- Load config -----------------
+CFG = configparser.ConfigParser()
+CFG.read(r"C:\T18\ops\watcher_config.ini")
+
+ROOT = Path(CFG.get("core", "root", fallback=r"C:\T18")).resolve()
+LOG_DIR = Path(CFG.get("core", "log_dir", fallback=r"C:\T18\logs")).resolve()
+LOCK_FILE = Path(CFG.get("core", "lock_file", fallback=r"C:\T18\.locks\notion_git_watcher.lock")).resolve()
+POLL_SECS = CFG.getint("core", "poll_seconds", fallback=5)
+GIT_INTERVAL_SECS = CFG.getint("core", "git_interval_seconds", fallback=120)
+NOTION_INDEX_MINS = CFG.getint("core", "notion_full_index_minutes", fallback=15)
+STATUS_DELETED = CFG.get("core", "status_deleted_value", fallback="Deleted")
+
+IGNORE_PATTERNS = [s.strip().lower() for s in CFG.get("ignore","patterns",fallback="").split(",") if s.strip()]
+
+DB_ID = CFG.get("notion","database_id")
+NTN_TOKEN = CFG.get("notion","integration_token")
+PROP_PATH = CFG.get("notion","prop_path", fallback="Path")
+PROP_SIZE = CFG.get("notion","prop_size", fallback="Size")
+PROP_MOD  = CFG.get("notion","prop_modified", fallback="Modified")
+PROP_STAT = CFG.get("notion","prop_status", fallback="Status")
+
+REPO_DIR   = Path(CFG.get("github","repo_dir", fallback=str(ROOT))).resolve()
+REMOTE     = CFG.get("github","remote_name", fallback="origin")
+BRANCH     = CFG.get("github","branch", fallback="main")
+AUTH_MODE  = CFG.get("github","auth", fallback="gcm").lower()
+GH_PAT     = CFG.get("github","pat", fallback="")
+COMMIT_MSG = CFG.get("github","commit_message", fallback="chore(watcher): autosync from watcher")
+PULL_REBASE= CFG.getboolean("github","pull_rebase", fallback=True)
+
+FORCE_IPV4 = CFG.getboolean("notion","force_ipv4", fallback=False) or os.environ.get("T18_FORCE_IPV4","").strip() == "1"
+
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "notion_git_watcher.log"
+
+def log(msg: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
+
+# Prefer IPv4 if requested (helps when IPv6 is blocked per-process)
+if FORCE_IPV4:
+    try:
+        import urllib3.util.connection as urllib3_cn
+        urllib3_cn.HAS_IPV6 = False
+        log("IPv6 disabled for requests (force_ipv4=true).")
+    except Exception as e:
+        log(f"Failed to disable IPv6: {e}")
+
+# ----------------- Notion helpers -----------------
+NOTION_BASE = "https://api.notion.com/v1"
+NOTION_HEADERS = {
+    "Authorization": f"Bearer {NTN_TOKEN}",
+    "Notion-Version": "2022-06-28",
+    "Content-Type": "application/json",
+}
+
+def notion_query_by_path(path_str: str):
+    url = f"{NOTION_BASE}/databases/{DB_ID}/query"
+    payload = {"filter": {"property": PROP_PATH, "title": {"equals": path_str}}}
+    r = requests.post(url, headers=NOTION_HEADERS, data=json.dumps(payload), timeout=30)
+    if r.status_code != 200:
+        log(f"Notion query error {r.status_code}: {r.text}")
+        return []
+    return r.json().get("results", [])
+
+def notion_create(path_str: str, size: int, modified_iso: str, status_value: str):
+    url = f"{NOTION_BASE}/pages"
+    props = {
+        PROP_PATH: {"title": [{"type":"text","text":{"content": path_str}}]},
+        PROP_SIZE: {"number": size},
+        PROP_MOD:  {"date": {"start": modified_iso}},
+    }
+    if PROP_STAT:
+        props[PROP_STAT] = {"select": {"name": status_value}}
+    payload = {"parent": {"database_id": DB_ID}, "properties": props}
+    r = requests.post(url, headers=NOTION_HEADERS, data=json.dumps(payload), timeout=30)
+    if r.status_code != 200:
+        log(f"Notion create error {r.status_code}: {r.text}")
+        return None
+    return r.json().get("id")
+
+def notion_update(page_id: str, size: int, modified_iso: str, status_value: str):
+    url = f"{NOTION_BASE}/pages/{page_id}"
+    props = {PROP_SIZE: {"number": size}, PROP_MOD: {"date": {"start": modified_iso}}}
+    if PROP_STAT:
+        props[PROP_STAT] = {"select": {"name": status_value}}
+    payload = {"properties": props}
+    r = requests.patch(url, headers=NOTION_HEADERS, data=json.dumps(payload), timeout=30)
+    if r.status_code not in (200, 202):
+        log(f"Notion update error {r.status_code}: {r.text}")
+        return False
+    return True
+
+def to_iso_utc(ts: float):
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+class NotionIndex:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.map = {}
+        self.last_full = 0
+
+    def ensure_full_index(self):
+        now = time.time()
+        if now - self.last_full < NOTION_INDEX_MINS * 60:
+            return
+        log("Refreshing full Notion index...")
+        start_cursor = None
+        tmp = {}
+        while True:
+            url = f"{NOTION_BASE}/databases/{DB_ID}/query"
+            payload = {"page_size": 100}
+            if start_cursor:
+                payload["start_cursor"] = start_cursor
+            r = requests.post(url, headers=NOTION_HEADERS, data=json.dumps(payload), timeout=60)
+            if r.status_code != 200:
+                log(f"Notion full index error {r.status_code}: {r.text}")
+                break
+            data = r.json()
+            for res in data.get("results", []):
+                title = res.get("properties",{}).get(PROP_PATH,{}).get("title",[])
+                path_val = "".join([t.get("plain_text","") for t in title]) if title else ""
+                if path_val:
+                    tmp[path_val] = res["id"]
+            if not data.get("has_more"):
+                break
+            start_cursor = data.get("next_cursor")
+        self.map = tmp
+        self.last_full = now
+        log(f"Notion index size: {len(self.map)}")
+
+    def get_page_id(self, path_str: str):
+        return self.map.get(path_str)
+
+    def set_page_id(self, path_str: str, page_id: str):
+        self.map[path_str] = page_id
+
+NOTION_IDX = NotionIndex()
+
+# ----------------- Git helpers -----------------
+def run_git(cmd, check=True):
+    env = os.environ.copy()
+    if AUTH_MODE == "pat" and GH_PAT:
+        env["GIT_ASKPASS"] = "echo"
+        env["GITHUB_TOKEN"] = GH_PAT
+    try:
+        res = subprocess.run(cmd, cwd=str(REPO_DIR), env=env, capture_output=True, text=True, timeout=180)
+        if check and res.returncode != 0:
+            log(f"git error: {' '.join(cmd)}\nstdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+        return res
+    except Exception as e:
+        log(f"git exception {cmd}: {e}")
+        return None
+
+def git_sync():
+    run_git(["git", "add", "-A"], check=False)
+    res = run_git(["git", "diff", "--cached", "--quiet"], check=False)
+    if res and res.returncode == 1:
+        run_git(["git", "commit", "-m", COMMIT_MSG], check=False)
+    if PULL_REBASE:
+        run_git(["git", "pull", "--rebase", REMOTE, BRANCH], check=False)
+    else:
+        run_git(["git", "pull", REMOTE, BRANCH], check=False)
+    run_git(["git", "push", REMOTE, BRANCH], check=False)
+
+# ----------------- Watcher -----------------
+class Handler(FileSystemEventHandler):
+    def on_any_event(self, event):
+        try:
+            if event.is_directory:
+                return
+            p = Path(getattr(event, "src_path", ""))
+            if not p:
+                return
+            if any(tok in str(p).lower() for tok in IGNORE_PATTERNS):
+                return
+            if event.event_type == "moved":
+                old = Path(event.src_path)
+                new = Path(event.dest_path)
+                if not any(tok in str(old).lower() for tok in IGNORE_PATTERNS):
+                    mark_deleted(old)
+                if not any(tok in str(new).lower() for tok in IGNORE_PATTERNS):
+                    upsert_file(new)
+                return
+            if event.event_type == "deleted":
+                mark_deleted(p); return
+            upsert_file(p)
+        except Exception as e:
+            log(f"handler exception: {e}")
+
+def upsert_file(p: Path):
+    try:
+        if not p.exists(): return
+        stat = p.stat()
+        path_str = str(p.resolve())
+        size = int(stat.st_size)
+        mod_iso = to_iso_utc(stat.st_mtime)
+        NOTION_IDX.ensure_full_index()
+        page_id = NOTION_IDX.get_page_id(path_str)
+        if page_id is None:
+            hits = notion_query_by_path(path_str)
+            if hits:
+                page_id = hits[0]["id"]; NOTION_IDX.set_page_id(path_str, page_id)
+        if page_id:
+            if notion_update(page_id, size, mod_iso, "Active"):
+                log(f"Updated Notion: {path_str} size={size}")
+        else:
+            new_id = notion_create(path_str, size, mod_iso, "Active")
+            if new_id:
+                NOTION_IDX.set_page_id(path_str, new_id)
+                log(f"Created Notion: {path_str} size={size}")
+    except Exception as e:
+        log(f"upsert_file error for {p}: {e}")
+
+def mark_deleted(p: Path):
+    try:
+        path_str = str(Path(p).resolve())
+        NOTION_IDX.ensure_full_index()
+        page_id = NOTION_IDX.get_page_id(path_str)
+        if page_id is None:
+            hits = notion_query_by_path(path_str)
+            if hits:
+                page_id = hits[0]["id"]; NOTION_IDX.set_page_id(path_str, page_id)
+        if page_id:
+            ok = notion_update(page_id, 0, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), STATUS_DELETED)
+            if ok: log(f"Marked Deleted in Notion: {path_str}")
+    except Exception as e:
+        log(f"mark_deleted error for {p}: {e}")
+
+def periodic_git():
+    while True:
+        try: git_sync()
+        except Exception as e: log(f"git_sync error: {e}")
+        time.sleep(GIT_INTERVAL_SECS)
+
+def main():
+    # Single instance lock
+    with open(LOCK_FILE, "w") as f:
+        try:
+            portalocker.lock(f, portalocker.LOCK_EX | portalocker.LOCK_NB)
+        except Exception:
+            log("Another instance detected. Exiting."); return
+
+        try: NOTION_IDX.ensure_full_index()
+        except Exception as e: log(f"Initial Notion index failed: {e}")
+
+        t = threading.Thread(target=periodic_git, daemon=True); t.start()
+
+        event_handler = Handler()
+        observer = Observer(); observer.schedule(event_handler, str(ROOT), recursive=True)
+        observer.start(); log("Watcher started.")
+        try:
+            while True: time.sleep(POLL_SECS)
+        except KeyboardInterrupt: pass
+        finally:
+            observer.stop(); observer.join()
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,258 @@
+# -*- coding: utf-8 -*-
+# C:\T18\tools\notion_watcher.py
+from __future__ import annotations
+
+import argparse
+import hashlib
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+import queue
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Optional
+
+# Third-party
+from notion_client import Client
+from notion_client.helpers import iterate_paginated_api  # noqa: F401 (reserved for future use)
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler, FileSystemEvent
+
+# Optional .env loader (local-only secrets)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=Path(r"C:\T18\.env"))
+except Exception:
+    pass
+
+# ---------------------------
+# Config
+# ---------------------------
+ROOT_DIR = Path(os.getenv("ROOT_DIR", r"C:\T18")).resolve()
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "").strip()
+NOTION_API_TOKEN = os.getenv("NOTION_API_TOKEN", "").strip()
+
+EXCLUDE_DIRS = {".git", ".venv", "__pycache__", ".pytest_cache", "logs", ".mypy_cache"}
+EXCLUDE_EXTS = {".pyc", ".pyo", ".pyd", ".sqlite", ".db", ".log"}
+EXCLUDE_NAMES = {".env", ".envrc"}
+
+DEBOUNCE_SECONDS = 1.0       # collapse rapid events for the same path
+FLUSH_INTERVAL_SECONDS = 2.0 # how often we drain the queue
+LOG_PATH = Path(r"C:\T18\logs\notion_watcher.log")
+
+# ---------------------------
+# Logging
+# ---------------------------
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+logger = logging.getLogger("notion_watcher")
+logger.setLevel(logging.INFO)
+handler = RotatingFileHandler(str(LOG_PATH), maxBytes=1_000_000, backupCount=3)
+fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+handler.setFormatter(fmt)
+logger.addHandler(handler)
+
+# ---------------------------
+# Notion Client
+# ---------------------------
+if not NOTION_DATABASE_ID or not NOTION_API_TOKEN:
+    print("ERROR: NOTION_DATABASE_ID or NOTION_API_TOKEN missing. Set them in C:\\T18\\.env")
+    sys.exit(2)
+
+notion = Client(auth=NOTION_API_TOKEN)
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def is_excluded(p: Path) -> bool:
+    # exclude by dir
+    for part in p.parts:
+        if part in EXCLUDE_DIRS:
+            return True
+    # exclude by name
+    if p.name in EXCLUDE_NAMES:
+        return True
+    # exclude by ext
+    if p.suffix.lower() in EXCLUDE_EXTS:
+        return True
+    return False
+
+def file_sha256(p: Path) -> Optional[str]:
+    try:
+        if not p.exists() or not p.is_file():
+            return None
+        h = hashlib.sha256()
+        with p.open("rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception as e:
+        logger.warning(f"sha256 failed for {p}: {e}")
+        return None
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+def query_page_by_path(path_str: str) -> Optional[str]:
+    """Return page_id in Notion for a given Path property, else None."""
+    try:
+        resp = notion.databases.query(
+            **{
+                "database_id": NOTION_DATABASE_ID,
+                "filter": {
+                    "property": "Path",
+                    "rich_text": {"equals": path_str}
+                },
+                "page_size": 1
+            }
+        )
+        results = resp.get("results", [])
+        if results:
+            return results[0]["id"]
+        return None
+    except Exception as e:
+        logger.error(f"Notion query failed for path={path_str}: {e}")
+        return None
+
+def upsert_page(path: Path, change_type: str):
+    """
+    Upsert a Notion row for file path with latest metadata.
+    change_type: Created|Modified|Deleted
+    """
+    path_abs = str(path)
+    sz = path.stat().st_size if path.exists() and path.is_file() else 0
+    sha = file_sha256(path) if change_type != "Deleted" else None
+
+    # Title uses path relative to ROOT_DIR when possible
+    try:
+        title_val = str(path.relative_to(ROOT_DIR))
+    except ValueError:
+        title_val = path.name
+
+    props = {
+        "File": {"title": [{"text": {"content": title_val}}]},
+        "Path": {"rich_text": [{"text": {"content": path_abs}}]},
+        "ChangeType": {"select": {"name": change_type}},
+        "Modified": {"date": {"start": now_iso()}},
+        "SizeBytes": {"number": int(sz)},
+        "Sha256": {"rich_text": [{"text": {"content": sha or ""}}]},
+    }
+
+    page_id = query_page_by_path(path_abs)
+    try:
+        if page_id:
+            notion.pages.update(page_id=page_id, properties=props)
+            logger.info(f"Updated Notion row for {path_abs} ({change_type})")
+        else:
+            notion.pages.create(parent={"database_id": NOTION_DATABASE_ID}, properties=props)
+            logger.info(f"Created Notion row for {path_abs} ({change_type})")
+    except Exception as e:
+        logger.error(f"Notion upsert failed for {path_abs}: {e}")
+
+# ---------------------------
+# Event Queue with Debounce
+# ---------------------------
+_event_q: "queue.Queue[tuple[str, Path]]" = queue.Queue()
+_last_seen: dict[str, float] = {}  # path -> timestamp
+
+def enqueue(kind: str, path: Path):
+    # ✅ FIX: include extensionless files (removed `not path.suffix` gate)
+    if is_excluded(path):
+        return
+    now = time.time()
+    key = f"{kind}:{str(path)}"
+    last = _last_seen.get(key, 0)
+    if (now - last) >= DEBOUNCE_SECONDS:
+        _event_q.put((kind, path))
+        _last_seen[key] = now
+
+class Handler(FileSystemEventHandler):
+    def on_created(self, event: FileSystemEvent):
+        if not event.is_directory:
+            enqueue("Created", Path(event.src_path))
+
+    def on_modified(self, event: FileSystemEvent):
+        if not event.is_directory:
+            enqueue("Modified", Path(event.src_path))
+
+    def on_moved(self, event: FileSystemEvent):
+        if not event.is_directory:
+            # treat as Deleted on src + Created on dst
+            enqueue("Deleted", Path(event.src_path))
+            enqueue("Created", Path(event.dest_path))
+
+    def on_deleted(self, event: FileSystemEvent):
+        if not event.is_directory:
+            enqueue("Deleted", Path(event.src_path))
+
+def worker():
+    batch: list[tuple[str, Path]] = []
+    while True:
+        try:
+            item = _event_q.get(timeout=FLUSH_INTERVAL_SECONDS)
+            batch.append(item)
+            # drain extras if available without blocking
+            while True:
+                try:
+                    batch.append(_event_q.get_nowait())
+                except queue.Empty:
+                    break
+        except queue.Empty:
+            pass
+
+        if not batch:
+            continue
+
+        # process unique latest per path (keep last event type)
+        latest: dict[str, str] = {}
+        for kind, p in batch:
+            latest[str(p)] = kind
+        batch.clear()
+
+        for p_str, kind in latest.items():
+            p = Path(p_str)
+            try:
+                upsert_page(p, kind)
+            except Exception as e:
+                logger.error(f"processing failed for {p_str}: {e}")
+
+def prime_scan():
+    """Initial scan to seed Notion with existing files (optional, idempotent)."""
+    # ✅ FIX: include extensionless files (removed `not p.suffix` gate)
+    for p in ROOT_DIR.rglob("*"):
+        if is_excluded(p) or p.is_dir():
+            continue
+        enqueue("Created", p)
+
+def main():
+    parser = argparse.ArgumentParser(description="T18 Notion real-time file watcher")
+    parser.add_argument("--root", default=str(ROOT_DIR), help="Root folder to watch")
+    parser.add_argument("--prime", action="store_true", help="Seed Notion with current files")
+    args = parser.parse_args()
+
+    root = Path(args.root).resolve()
+    if not root.exists():
+        print(f"ERROR: root path does not exist: {root}")
+        sys.exit(2)
+
+    logger.info(f"Starting watcher on {root}")
+    if args.prime:
+        logger.info("Priming initial file index...")
+        prime_scan()
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+    obs = Observer()
+    obs.schedule(Handler(), path=str(root), recursive=True)
+    obs.start()
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        obs.stop()
+    obs.join()
+
+if __name__ == "__main__":
+    main()
