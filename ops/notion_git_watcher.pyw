@@ -286,3 +286,45 @@ if __name__ == "__main__":
     main()
 
 
+
+
+def build_props_with_git(p, title_prop, optmap):
+    # Wraps build_props(...) and injects a checkbox for "git tracked" if configured
+    import subprocess, configparser
+    from pathlib import Path
+
+    props = build_props(p, title_prop, optmap)
+
+    ini = r"C:\T18\ops\watcher_config.ini"
+    cfg = configparser.ConfigParser()
+    try:
+        cfg.read(ini, encoding="utf-8")
+    except Exception:
+        return props
+
+    prop_name = cfg.get("notion", "prop_git_tracked", fallback="").strip()
+    if not prop_name:
+        return props
+
+    repo_dir = cfg.get("github", "repo_dir", fallback=str(Path(p).anchor)).strip()
+    if not repo_dir:
+        repo_dir = str(Path(p).anchor)
+
+    tracked = False
+    try:
+        repo_dir_path = Path(repo_dir).resolve()
+        p_path = Path(p).resolve()
+        rel = p_path.relative_to(repo_dir_path)
+
+        # Exit code: 0 => tracked, nonzero => untracked
+        completed = subprocess.run(
+            ["git", "-C", str(repo_dir_path), "ls-files", "--error-unmatch", str(rel)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        )
+        tracked = (completed.returncode == 0)
+    except Exception:
+        tracked = False
+
+    props[prop_name] = {"checkbox": bool(tracked)}
+    return props
