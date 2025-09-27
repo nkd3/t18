@@ -36,3 +36,7 @@ start_t18_notion_env.vbs
 start_watcher.cmd
 tools_watch_and_sync_notion.py
 tools/notion_watcher.py
+# local secrets (never commit)
+ops/watcher_config.ini
+ops/*.local.ini
+.env
