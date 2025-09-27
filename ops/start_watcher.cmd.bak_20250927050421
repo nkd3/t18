@@ -1,0 +1,27 @@
+@echo off
+REM ===== T18 hardened watcher launcher (no window, no git UI) =====
+cd /d C:\T18
+
+REM Minimal PATH: prefer Git\bin (real git.exe), NOT Git\cmd shims
+set "PATH=%SystemRoot%\System32;%SystemRoot%\System32\WindowsPowerShell\v1.0;C:\Program Files\Git\bin;C:\Program Files (x86)\Git\bin"
+
+REM Kill any interactive prompts or helper UIs:
+set "GIT_TERMINAL_PROMPT=0"
+set "GCM_INTERACTIVE=Never"
+set "GIT_ASKPASS=echo"
+set "SSH_ASKPASS=echo"
+set "GIT_SSH_COMMAND=ssh -oBatchMode=yes -o ConnectTimeout=8"
+set "GIT_PAGER=cat"
+set "GIT_FLUSH=1"
+
+REM (Optional but nice): lock Git to English to keep logs predictable
+set "LANG=C"
+set "LC_ALL=C"
+
+REM Log what Git executable will be used
+where git > "C:\T18\logs\env.txt" 2>&1
+git --version >> "C:\T18\logs\env.txt" 2>&1
+
+REM Launch the watcher (pythonw has no console)
+"C:\T18\.venv\Scripts\pythonw.exe" "C:\T18\ops\notion_git_watcher.pyw"  >> "C:\T18\logs\notion_git_watcher.out" 2>&1
+
