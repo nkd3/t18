@@ -1,216 +1,204 @@
-# t18_autosync.py  (v2 - pruned walker + single-instance + heartbeat)
-# Local-only autosync: C:\T18 -> origin/$BRANCH
-# Runs hidden via pythonw.exe + VBS + Scheduled Task. Logs to C:\T18\logs\.
-
-import os, sys, time, subprocess
+# t18_autosync.py — one-way (local -> remote) push-only autosync
+# Runs completely hidden when launched via pythonw.exe
+import os, sys, time, subprocess, traceback, hashlib, threading
 from pathlib import Path
 
-REPO_DIR = Path(r"C:\T18").resolve()
-BRANCH   = os.environ.get("T18_BRANCH", "main")
-DEBOUNCE_SECONDS = int(os.environ.get("T18_DEBOUNCE", "90"))
-MIN_COMMIT_INTERVAL = int(os.environ.get("T18_MIN_COMMIT_SEC", "300"))
-POLL_INTERVAL = 3
+ROOT       = Path(r"C:\T18").resolve()
+LOG_DIR    = ROOT / "logs"
+LOG        = LOG_DIR / "t18_autosync.log"
+CRASH_LOG  = LOG_DIR / "t18_autosync_crash.log"
+LOCK_FILE  = ROOT / ".locks" / "t18_autosync.lock"
 
-LOG_DIR  = Path(r"C:\T18\logs")
-LOG_PATH = LOG_DIR / "t18_autosync.log"
-CRASH_LOG_PATH = LOG_DIR / "t18_autosync_crash.log"
-LOCK_PATH = LOG_DIR / "t18_autosync.lock"
+# Tunables
+SCAN_INTERVAL_SEC     = int(os.getenv("T18_SCAN_SEC", "15"))   # how often to scan FS
+DEBOUNCE_SEC          = int(os.getenv("T18_DEBOUNCE", "30"))   # wait after last change
+MIN_COMMIT_INTERVAL   = int(os.getenv("T18_MIN_COMMIT_SEC", "60"))
+GIT_REMOTE            = os.getenv("T18_REMOTE", "origin")
+GIT_BRANCH            = os.getenv("T18_BRANCH", "main")
 
-# Hard-ignore (directories fully pruned) + file extensions ignored
-IGNORE_DIRS = {".git", ".venv", "logs", "__pycache__", "history", "parquet", "data", "dist", "build", ".idea", ".vscode", "ZZZ"}
-IGNORE_EXT  = {".pyc", ".zip", ".db", ".sqlite", ".sqlite3", ".parquet"}
+# Ignore rules (lightweight)
+IGNORE_DIRS = {".git", ".venv", "__pycache__", "logs", ".locks", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+IGNORE_SUFFIXES = {".db", ".sqlite", ".sqlite3", ".parquet", ".zip", ".gz", ".lz4", ".lock"}
+IGNORE_FILES = {"t18_autosync.lock"}
 
-MAX_FILES_IN_MSG = 12
-HEARTBEAT_EVERY = 60  # seconds
+# -------- logging ----------
+def _ensure_dirs():
+    (ROOT / ".locks").mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-def log(msg: str):
+def log(msg):
+    _ensure_dirs()
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    with LOG.open("a", encoding="utf-8") as f:
+        f.write(f"[{ts}] {msg}\n")
+
+def crash(msg):
+    _ensure_dirs()
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    with CRASH_LOG.open("a", encoding="utf-8") as f:
+        f.write(f"[{ts}] {msg}\n")
+
+# -------- single instance guard ----------
+def take_lock():
+    _ensure_dirs()
     try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        with LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {msg}\n")
-    except Exception:
-        pass
-
-def crash(msg: str):
-    try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        with CRASH_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {msg}\n")
-    except Exception:
-        pass
-
-def run_git(args, check=True, text=True):
-    return subprocess.run(["git", *args], cwd=REPO_DIR, check=check, text=text, capture_output=True)
-
-def single_instance_guard():
-    try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        if LOCK_PATH.exists():
-            # Another instance likely running
-            log("lock present; exiting to keep single instance.")
-            sys.exit(0)
-        LOCK_PATH.write_text(str(os.getpid()), encoding="utf-8")
-    except Exception as e:
-        crash(f"lock error: {e}")
-        # Not fatal—continue without lock
-
-def cleanup_lock():
-    try:
-        if LOCK_PATH.exists():
-            LOCK_PATH.unlink(missing_ok=True)
-    except Exception as e:
-        crash(f"unlock error: {e}")
-
-def initial_checks():
-    if not REPO_DIR.exists():
-        raise RuntimeError(f"Repo folder missing: {REPO_DIR}")
-    try:
-        run_git(["rev-parse", "--is-inside-work-tree"])
-    except subprocess.CalledProcessError:
-        raise RuntimeError(f"Not a git repo: {REPO_DIR}")
-    try:
-        run_git(["fetch", "--all"], check=False)
-    except Exception as e:
-        log(f"fetch warning: {e}")
-
-def iter_files_pruned(root: Path):
-    # Pruned os.walk: removes IGNORE_DIRS from traversal so we never descend into them.
-    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
-        # Prune ignored directories in-place
-        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
-        # Skip paths that already include an ignored part (extra safety)
-        parts = Path(dirpath).parts
-        if any(p in IGNORE_DIRS for p in parts):
-            continue
-        # Yield files not in ignored ext
-        for fn in filenames:
-            p = Path(dirpath) / fn
+        if LOCK_FILE.exists():
+            # stale lock? if older than 1 day, reclaim
             try:
-                if p.suffix.lower() in IGNORE_EXT:
-                    continue
-                yield p
+                if time.time() - LOCK_FILE.stat().st_mtime > 86400:
+                    LOCK_FILE.unlink(missing_ok=True)
             except Exception:
-                continue
+                pass
+        fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w") as f:
+            f.write(str(os.getpid()))
+        return True
+    except FileExistsError:
+        return False
 
-def snapshot(root: Path):
-    m = {}
-    for p in iter_files_pruned(root):
-        try:
-            m[str(p.relative_to(root))] = p.stat().st_mtime
-        except FileNotFoundError:
-            continue
-        except PermissionError:
-            # Ignore transient locks/permissions
-            continue
-    return m
-
-def build_commit_message(changed_files):
-    n = len(changed_files)
-    sample = sorted(changed_files)[:MAX_FILES_IN_MSG]
-    extra = "" if n <= MAX_FILES_IN_MSG else f" (+{n - MAX_FILES_IN_MSG} more)"
-    preview = ", ".join(sample)
-    return f"autosync: {n} file(s) [{preview}{extra}]"
-
-def stage_commit_push(changed_files):
-    if not changed_files:
-        return
+def release_lock():
     try:
-        run_git(["add", "-A"], check=True)
-    except subprocess.CalledProcessError as e:
-        log(f"git add error: {e.stderr.strip()}")
-        return
+        LOCK_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
 
-    try:
-        diff = run_git(["diff", "--cached", "--name-only"], check=True).stdout.strip()
-        if not diff:
-            log("no staged changes (skip commit)")
-            return
-    except subprocess.CalledProcessError as e:
-        log(f"git diff error: {e.stderr.strip()}")
-        return
+# -------- git helpers (hidden, no console) ----------
+def _git_path():
+    # Prefer real git.exe to avoid .cmd wrappers
+    candidates = [
+        r"C:\Program Files\Git\bin\git.exe",
+        r"C:\Program Files (x86)\Git\bin\git.exe",
+        os.environ.get("GIT_EXE", ""),
+    ]
+    for c in candidates:
+        if c and Path(c).exists():
+            return c
+    return "git"  # fallback (still hidden below)
 
-    msg = build_commit_message(changed_files)
-    try:
-        run_git(["commit", "-m", msg], check=True)
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+DETACHED_PROCESS = 0x00000008
+STARTF_USESHOWWINDOW = getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
+
+def _run_git(args, timeout=120):
+    cmd = [_git_path(), "-C", str(ROOT), *args]
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= STARTF_USESHOWWINDOW
+    si.wShowWindow = 0
+    env = os.environ.copy()
+    # ensure fully non-interactive, no UI
+    env.setdefault("HOME", str(ROOT / "system_home"))
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    env.setdefault("GCM_INTERACTIVE", "Never")
+    env.setdefault("GIT_ASKPASS", "echo")
+    env.setdefault("SSH_ASKPASS", "echo")
+    env.setdefault("GIT_PAGER", "cat")
+    p = subprocess.run(
+        cmd,
+        cwd=str(ROOT),
+        env=env,
+        startupinfo=si,
+        creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS,
+        shell=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+def repo_dirty():
+    rc, out, err = _run_git(["status", "--porcelain"])
+    if rc != 0:
+        log(f"git status error rc={rc} err={err}")
+        return False, ""
+    return bool(out), out
+
+def commit_all():
+    rc, out, err = _run_git(["add", "-A"])
+    if rc != 0:
+        log(f"git add error rc={rc} err={err}")
+        return False
+    msg = f'autosync: {time.strftime("%Y-%m-%d %H:%M:%S")}'
+    rc, out, err = _run_git(["commit", "-m", msg, "--quiet"])
+    if rc == 0:
         log(f"committed: {msg}")
-    except subprocess.CalledProcessError as e:
-        stderr = (e.stderr or "").strip()
-        if "nothing to commit" in stderr:
-            log("nothing to commit")
-            return
-        log(f"git commit error: {stderr}")
-        return
+        return True
+    # rc!=0 often means "nothing to commit"
+    if "nothing to commit" in (out + " " + err).lower():
+        return False
+    log(f"git commit rc={rc} out={out} err={err}")
+    return False
 
-    # Safer on shared branches
-    try:
-        run_git(["pull", "--rebase", "origin", BRANCH], check=False)
-    except subprocess.CalledProcessError as e:
-        log(f"git pull warning: {e.stderr.strip()}")
+def push_quiet():
+    rc, out, err = _run_git(["push", "--quiet", "--porcelain", GIT_REMOTE, GIT_BRANCH])
+    if rc == 0:
+        log(f"pushed to {GIT_REMOTE}/{GIT_BRANCH}")
+        return True
+    # Do NOT fetch/pull; just log and continue (one-way)
+    log(f"push failed (one-way, no fetch): rc={rc} out={out} err={err}")
+    return False
 
-    try:
-        run_git(["push", "origin", BRANCH], check=True)
-        log(f"pushed to origin/{BRANCH}")
-    except subprocess.CalledProcessError as e:
-        log(f"git push error: {e.stderr.strip()}")
+# -------- scan / debounce ----------
+def iter_files():
+    for root, dirs, files in os.walk(ROOT):
+        # prune ignore dirs
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        for name in files:
+            if name in IGNORE_FILES: 
+                continue
+            p = Path(root) / name
+            if p.suffix.lower() in IGNORE_SUFFIXES:
+                continue
+            yield p
+
+def fs_fingerprint():
+    # lightweight hash: paths + mtimes + sizes
+    h = hashlib.sha1()
+    for p in sorted(iter_files()):
+        try:
+            st = p.stat()
+        except Exception:
+            continue
+        h.update(str(p.relative_to(ROOT)).encode("utf-8", "ignore"))
+        h.update(str(int(st.st_mtime)).encode())
+        h.update(str(st.st_size).encode())
+    return h.hexdigest()
 
 def main():
-    single_instance_guard()
-    log("=== T18 autosync starting ===")
-    try:
-        initial_checks()
-    except Exception as e:
-        crash(f"startup error: {e}")
-        log(f"startup error: {e}")
-        cleanup_lock()
+    if not take_lock():
+        log("another instance detected; exiting")
         return
-
-    last_snap = snapshot(REPO_DIR)
-    last_change_ts = 0.0
-    last_commit_ts = 0.0
-    changed_since_last = set()
-    last_heartbeat = time.time()
-
+    log("=== t18_autosync starting (push-only, hidden) ===")
+    last_fp = ""
+    last_change_t = 0.0
+    last_commit_t = 0.0
+    hb_t = 0.0
     try:
         while True:
-            time.sleep(POLL_INTERVAL)
-            new_snap = snapshot(REPO_DIR)
-
-            changed = set()
-            # mods/adds
-            for rel, mt in new_snap.items():
-                if rel not in last_snap or last_snap[rel] != mt:
-                    changed.add(rel)
-            # deletes
-            for rel in last_snap.keys() - new_snap.keys():
-                changed.add(rel)
-
-            if changed:
-                last_change_ts = time.time()
-                changed_since_last |= changed
-                log(f"detected changes: {len(changed)}")
-
+            fp = fs_fingerprint()
             now = time.time()
-            if changed_since_last and (now - last_change_ts >= DEBOUNCE_SECONDS) and (now - last_commit_ts >= MIN_COMMIT_INTERVAL):
-                stage_commit_push(changed_since_last)
-                changed_since_last.clear()
-                last_commit_ts = now
-                last_snap = new_snap
-            else:
-                last_snap = new_snap
-
+            if fp != last_fp:
+                last_fp = fp
+                last_change_t = now
             # heartbeat
-            if now - last_heartbeat >= HEARTBEAT_EVERY:
+            if now - hb_t >= 60:
                 log("heartbeat: running")
-                last_heartbeat = now
-    except Exception as e:
-        crash(f"loop error: {e}")
+                hb_t = now
+            # debounce window passed and min commit spacing respected?
+            if last_change_t and (now - last_change_t >= DEBOUNCE_SEC) and (now - last_commit_t >= MIN_COMMIT_INTERVAL):
+                dirty, detail = repo_dirty()
+                if dirty:
+                    if commit_all():
+                        push_quiet()
+                        last_commit_t = now
+                else:
+                    # still push if commit was external (rare)
+                    pass
+            time.sleep(SCAN_INTERVAL_SEC)
+    except Exception:
+        crash(traceback.format_exc())
+        log("crashed; see crash log")
     finally:
-        cleanup_lock()
+        release_lock()
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        crash(f"fatal error: {e}")
+    main()
