@@ -40,3 +40,14 @@ tools/notion_watcher.py
 ops/watcher_config.ini
 ops/*.local.ini
 .env
+
+/.venv/
+/logs/
+/.locks/
+/__pycache__/
+/*.db
+*.sqlite*
+*.parquet
+*.zip
+*.gz
+*.lock
