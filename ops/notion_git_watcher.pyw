@@ -1,4 +1,52 @@
 # -*- coding: utf-8 -*-
+
+# ---- BEGIN: silent-subprocess shim (prevents flashing console windows) ----
+try:
+    import os, subprocess
+    CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    STARTF_USESHOWWINDOW = getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
+
+    def _apply_silent_defaults(kwargs: dict):
+        # Hide window
+        si = kwargs.get("startupinfo")
+        if si is None:
+            si = subprocess.STARTUPINFO()
+        try:
+            si.dwFlags |= STARTF_USESHOWWINDOW
+            si.wShowWindow = 0
+        except Exception:
+            pass
+        kwargs["startupinfo"] = si
+
+        # No console window
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | CREATE_NO_WINDOW
+
+        # Don’t use a shell (reduces extra conhost.exe)
+        kwargs.setdefault("shell", False)
+
+        # Make git fully non-interactive
+        env = os.environ.copy()
+        env.setdefault("GIT_TERMINAL_PROMPT", "0")
+        env.setdefault("GCM_INTERACTIVE", "Never")
+        env.setdefault("GIT_ASKPASS", "echo")
+        kwargs["env"] = {**env, **kwargs.get("env", {})}
+        return kwargs
+
+    _orig_run = subprocess.run
+    def _silent_run(*a, **kw):
+        kw = _apply_silent_defaults(kw)
+        return _orig_run(*a, **kw)
+    subprocess.run = _silent_run
+
+    _orig_popen = subprocess.Popen
+    def _silent_popen(*a, **kw):
+        kw = _apply_silent_defaults(kw)
+        return _orig_popen(*a, **kw)
+    subprocess.Popen = _silent_popen
+except Exception:
+    pass
+# ----  END: silent-subprocess shim  ----
+
 """
 Local-only watcher for C:\T18
 - Upsert files into Notion DB (Path unique key)
