@@ -3,7 +3,6 @@
 # ---- BEGIN: silent-subprocess shim (prevents flashing console windows) ----
 try:
     import os, subprocess
-from ops._silent_git2 import run_git_hidden
 
 # --- FORCE-HIDE-SUBPROCESS (do not remove) ---
 import os, sys, shlex, subprocess

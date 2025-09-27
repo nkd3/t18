@@ -13,47 +13,42 @@ bak.write_text(src, encoding="utf-8")
 
 changed = False
 
-# 1) Ensure our helper import is present just after the first import block
-shim = "\nfrom ops._silent_git2 import run_git_hidden\n"
-m = re.search(r"(^(\s*)(import|from)\b[^\n]*\n(?:[ \t]*(?:import|from)\b[^\n]*\n)*)", src, flags=re.M)
-if m and "from ops._silent_git2 import run_git_hidden" not in src:
-    src = src[:m.end()] + shim + src[m.end():]
+# 1) Ensure our helper import is present
+if "from ops._silent_git2 import run_git_hidden" not in src:
+    m = re.search(r"(^(\s*)(import|from)\b[^\n]*\n(?:[ \t]*(?:import|from)\b[^\n]*\n)*)", src, flags=re.M)
+    if m:
+        src = src[:m.end()] + "from ops._silent_git2 import run_git_hidden\n" + src[m.end():]
+    else:
+        src = "from ops._silent_git2 import run_git_hidden\n" + src
     changed = True
 
-# 2) Replace direct git subprocess invocations with run_git_hidden
-#    Handle typical patterns your watcher likely uses:
-patterns = [
-    # subprocess.run([...,"git",...])
-    (r"subprocess\.run\(\s*\[(?P<head>[^]]*?)\]\s*(?P<rest>[\),])",
-     lambda mo: re.sub(r'([\'"])git(\.exe)?\1', '\"git\"',  # normalize
-                       f"run_git_hidden([{mo.group('head')}]){mo.group('rest')}")
-    ),
-    # subprocess.run("git ...", shell=True/False)
-    (r"subprocess\.run\(\s*([\"'])git[^)]*\)", 
-     lambda mo: "run_git_hidden(" + mo.group(0)[len("subprocess.run("):-1] + ")"),
-    ),
-    # check_output([...,"git",...]) or check_call(...)
-    (r"subprocess\.(check_output|check_call)\(\s*\[(?P<head>[^]]*?)\]\s*(?P<rest>[\),])",
-     lambda mo: re.sub(r'([\'"])git(\.exe)?\1', '\"git\"',
-                       f"run_git_hidden([{mo.group('head')}]){mo.group('rest')}")
-    ),
-]
+# 2) Replace any subprocess.run([...,"git",...]) calls
+pattern1 = re.compile(r"subprocess\.run\(\s*\[(.*?)\](.*?)\)", flags=re.S)
+src2 = pattern1.sub(r"run_git_hidden([\1])\2", src)
+if src2 != src:
+    src = src2
+    changed = True
 
-for pat, repl in patterns:
-    new = re.sub(pat, repl, src)
-    if new != src:
-        src = new
-        changed = True
+# 3) Replace subprocess.run("git ...") style calls
+pattern2 = re.compile(r"subprocess\.run\(\s*([\"'])git.*?\)", flags=re.S)
+src2 = pattern2.sub(lambda m: "run_git_hidden(" + m.group(0)[len("subprocess.run("):-1] + ")", src)
+if src2 != src:
+    src = src2
+    changed = True
 
-# 3) Best-effort replace common helper wrappers if present (e.g., git_status(), git_pull(), etc.)
-src = re.sub(r"\bgit\s+status\b", "git status", src)  # keep text stable
-src = re.sub(
-    r"def\s+git_(status|pull|push|add|commit|revparse)\s*\([^\)]*\):\s*\n",
-    r"\g<0># NOTE: implementation patched to use run_git_hidden\n", src
-)
+# 4) Replace check_output/check_call([...,"git",...])
+pattern3 = re.compile(r"subprocess\.(check_output|check_call)\(\s*\[(.*?)\](.*?)\)", flags=re.S)
+src2 = pattern3.sub(r"run_git_hidden([\2])\3", src)
+if src2 != src:
+    src = src2
+    changed = True
 
-# 4) Prevent any stray os.system("git ...")
-src = re.sub(r"os\.system\(\s*([\"'])git\s", r"run_git_hidden(\1git ", src)
+# 5) Replace os.system("git ...")
+pattern4 = re.compile(r"os\.system\(\s*([\"'])git\s")
+src2 = pattern4.sub(r"run_git_hidden(\1git ", src)
+if src2 != src:
+    src = src2
+    changed = True
 
 if changed:
     w.write_text(src, encoding="utf-8")
