@@ -1,35 +1,5 @@
-# --- begin: _run_git_hidden ---
-_CREATE_NO_WINDOW     = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-_DETACHED_PROCESS     = 0x00000008
-_STARTF_USESHOWWINDOW = getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
-_SW_HIDE              = 0
-
-def _run_git_hidden(args, cwd=r"C:\T18"):
-    si = subprocess.STARTUPINFO()
-    si.dwFlags |= _STARTF_USESHOWWINDOW
-    si.wShowWindow = _SW_HIDE
-    env = os.environ.copy()
-    env.setdefault("GIT_TERMINAL_PROMPT", "0")
-    env.setdefault("GCM_INTERACTIVE", "Never")
-    env.setdefault("GIT_ASKPASS", "echo")
-    env.setdefault("SSH_ASKPASS", "echo")
-    env.setdefault("GIT_PAGER", "cat")
-    git = r"C:\Program Files\Git\bin\git.exe"
-    if not os.path.exists(git):
-        git = r"C:\Program Files (x86)\Git\bin\git.exe"
-    if args and args[0].lower() == "git":
-        args = [git] + list(args[1:])
-    return _run_git_hidden(
-        args,
-        cwd=cwd,
-        env=env,
-        startupinfo=si,
-        creationflags=_CREATE_NO_WINDOW | _DETACHED_PROCESS,
-        shell=False,
-        capture_output=True,
-        text=True,
-    )
-# --- end: _run_git_hidden ---
+import subprocess
+import os
 # --- force git identity for service context (SYSTEM) ---
 os.environ.setdefault('GIT_AUTHOR_NAME',    'nkd3')
 os.environ.setdefault('GIT_AUTHOR_EMAIL',   'neelkanth.dwibedi@gmail.com')
