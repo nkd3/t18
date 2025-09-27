@@ -1,0 +1,5 @@
+[credential]
+	interactive = never
+	prompt = none
+[core]
+	pager = cat
