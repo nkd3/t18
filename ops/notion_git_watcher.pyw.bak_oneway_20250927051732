@@ -210,7 +210,7 @@ except Exception:
 Local-only watcher for C:\T18
 - Upsert files into Notion DB (Path unique key)
 - Mark deletions as Status=Deleted
-# [one-way] removed: - Auto-commit/pull/push to GitHub
+- Auto-commit/pull/push to GitHub
 - Single instance via lock file
 - Hidden via pythonw.exe (no console)
 - NEW: Optional IPv4-only mode via config [notion] force_ipv4=true or env T18_FORCE_IPV4=1
@@ -256,7 +256,7 @@ BRANCH     = CFG.get("github","branch", fallback="main")
 AUTH_MODE  = CFG.get("github","auth", fallback="gcm").lower()
 GH_PAT     = CFG.get("github","pat", fallback="")
 COMMIT_MSG = CFG.get("github","commit_message", fallback="chore(watcher): autosync from watcher")
-# [one-way] removed: PULL_REBASE= CFG.getboolean("github","pull_rebase", fallback=True)
+PULL_REBASE= CFG.getboolean("github","pull_rebase", fallback=True)
 
 FORCE_IPV4 = CFG.getboolean("notion","force_ipv4", fallback=False) or os.environ.get("T18_FORCE_IPV4","").strip() == "1"
 
@@ -393,9 +393,9 @@ def git_sync():
     if res and res.returncode == 1:
         run_git([ _GIT, "commit", "-m", COMMIT_MSG], check=False)
     if PULL_REBASE:
-# [one-way] removed:         run_git([ _GIT, "pull", "--rebase", REMOTE, BRANCH], check=False)
+        run_git([ _GIT, "pull", "--rebase", REMOTE, BRANCH], check=False)
     else:
-# [one-way] removed:         run_git([ _GIT, "pull", REMOTE, BRANCH], check=False)
+        run_git([ _GIT, "pull", REMOTE, BRANCH], check=False)
     run_git([ _GIT, "push", REMOTE, BRANCH], check=False)
 
 # ----------------- Watcher -----------------
