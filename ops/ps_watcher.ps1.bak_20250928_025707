@@ -242,7 +242,121 @@ try {
   Log ("FATAL: {0}" -f $_)
 }
 # === /ENSURE ===================================================================
+# ---------- Notion helpers (idempotent) ----------
+$global:__nt_headers = $null
+function Get-NotionHeaders {
+  if($null -ne $global:__nt_headers){ return $global:__nt_headers }
+  $token=[Environment]::GetEnvironmentVariable('NOTION_TOKEN','User')
+  $db=[Environment]::GetEnvironmentVariable('NOTION_DATABASE_ID','User')
+  if(-not $token -or -not $db){ throw "NOTION_TOKEN/DB missing" }
+  if($db -match '^[0-9a-fA-F]{32}$'){ $db = $db.Insert(20,'-').Insert(16,'-').Insert(12,'-').Insert(8,'-') }
+  $global:__dbId = $db
+  $global:__nt_headers = @{ Authorization="Bearer $token"; "Notion-Version"="2022-06-28"; "Content-Type"="application/json" }
+  return $global:__nt_headers
+}
 
+# DB property names (read once; your DB uses Path/Status/Modified/Size)
+$global:__titleProp    = if($env:NOTION_TITLE_PROP){ $env:NOTION_TITLE_PROP } else { 'Path' }
+$global:__statusProp   = if($env:NOTION_PROP_STATUS){ $env:NOTION_PROP_STATUS } else { 'Status' }
+$global:__modifiedProp = if($env:NOTION_PROP_MODIFIED){ $env:NOTION_PROP_MODIFIED } else { 'Modified' }
+$global:__sizeProp     = if($env:NOTION_PROP_SIZE){ $env:NOTION_PROP_SIZE } else { 'Size' }
+$global:__deletedVal   = if($env:NOTION_STATUS_VALUE_DELETED){ $env:NOTION_STATUS_VALUE_DELETED } else { 'deleted' }
+$global:__activeVal    = if($env:NOTION_STATUS_VALUE){ $env:NOTION_STATUS_VALUE } else { 'Active' }
+
+function Normalize-Path([string]$p){ $p -replace '/', '\' }
+
+function Find-PageByTitle([string]$title, [int]$retries=6){
+  $headers = Get-NotionHeaders
+  $db = $global:__dbId
+  $title = Normalize-Path $title
+  for($i=0;$i -lt $retries;$i++){
+    try{
+      $body = @{ page_size=1; filter=@{ property=$global:__titleProp; title=@{ equals=$title } } } | ConvertTo-Json -Depth 10
+      $r = Invoke-RestMethod -Method Post -Uri "https://api.notion.com/v1/databases/$db/query" -Headers $headers -Body $body -ErrorAction Stop
+      if($r.results.Count -gt 0){ return $r.results[0] }
+    } catch { }
+    Start-Sleep -Milliseconds 700
+  }
+  return $null
+}
+
+function Ensure-PageForPath([string]$path){
+  $headers = Get-NotionHeaders
+  $db = $global:__dbId
+  $path = Normalize-Path $path
+  $existing = Find-PageByTitle $path 3
+  if($existing){ return $existing.id }
+
+  $props = @{
+    ($global:__titleProp) = @{ title=@(@{ text=@{ content=$path } }) }
+    ($global:__statusProp)= @{ select=@{ name=$global:__activeVal } }
+    ($global:__sizeProp)  = @{ number = 0 }
+    ($global:__modifiedProp) = @{ date=@{ start=(Get-Date).ToUniversalTime().ToString('o') } }
+  }
+  $payload = @{ parent=@{ database_id=$db }; properties=$props } | ConvertTo-Json -Depth 10
+  $pg = Invoke-RestMethod -Method Post -Uri "https://api.notion.com/v1/pages" -Headers $headers -Body $payload -ErrorAction Stop
+  return $pg.id
+}
+
+function Add-PreviewBlock([string]$pageGuid, [string]$path){
+  try{
+    $text = (Get-Content -LiteralPath $path -Raw -EA Stop)
+    if(-not $text){ return }
+    if($text.Length -gt 1800){ $text = $text.Substring(0,1800) }
+  } catch { return }  # binary/unreadable -> skip
+
+  $lang='plain text'
+  switch -regex ($path){
+    '.*\.ps1$' { $lang='powershell' }
+    '.*\.py$'  { $lang='python' }
+    '.*\.cmd$' { $lang='shell' }
+    '.*\.(json|yml|yaml|toml)$' { $lang='markup' }
+    '.*\.md$'  { $lang='markdown' }
+  }
+  $headers = Get-NotionHeaders
+  $payload = @{ children = @(@{
+    object='block'; type='code'
+    code=@{ language=$lang; rich_text=@(@{ type='text'; text=@{ content=$text }}) }
+  }) } | ConvertTo-Json -Depth 10
+  Invoke-RestMethod -Method Patch -Uri ("https://api.notion.com/v1/blocks/{0}/children" -f $pageGuid) -Headers $headers -Body $payload -ErrorAction SilentlyContinue | Out-Null
+}
+
+function Upsert-ActiveWithPreview([string]$path){
+  $path = Normalize-Path $path
+  if(-not (Test-Path -LiteralPath $path)){ return }  # might be mid-rename
+  $pageGuid = Ensure-PageForPath $path
+  $headers = Get-NotionHeaders
+  $props = @{
+    ($global:__statusProp)   = @{ select=@{ name=$global:__activeVal } }
+    ($global:__sizeProp)     = @{ number = (Get-Item -EA SilentlyContinue $path).Length }
+    ($global:__modifiedProp) = @{ date=@{ start=(Get-Date).ToUniversalTime().ToString('o') } }
+  }
+  $patch = @{ properties = $props } | ConvertTo-Json -Depth 10
+  Invoke-RestMethod -Method Patch -Uri ("https://api.notion.com/v1/pages/{0}" -f $pageGuid) -Headers $headers -Body $patch -ErrorAction SilentlyContinue | Out-Null
+  Add-PreviewBlock $pageGuid $path
+  Log ("SYNCED: {0} size={1}" -f $path, $props[$global:__sizeProp].number)
+}
+
+function Mark-DeletedSafe([string]$path){
+  $path = Normalize-Path $path
+  $headers = Get-NotionHeaders
+  $page = Find-PageByTitle $path 6
+  if(-not $page){
+    Log ("DELETE TOMB?: row not found for {0}" -f $path)
+    # Create tombstone row so DB stays accurate
+    $pageGuid = Ensure-PageForPath $path
+    $page = @{ id = $pageGuid }
+  }
+  $pageGuid = $page.id
+  $props = @{
+    ($global:__statusProp)   = @{ select=@{ name=$global:__deletedVal } }
+    ($global:__sizeProp)     = @{ number = 0 }
+    ($global:__modifiedProp) = @{ date=@{ start=(Get-Date).ToUniversalTime().ToString('o') } }
+  }
+  $patch = @{ properties=$props } | ConvertTo-Json -Depth 10
+  Invoke-RestMethod -Method Patch -Uri ("https://api.notion.com/v1/pages/{0}" -f $pageGuid) -Headers $headers -Body $patch -ErrorAction SilentlyContinue | Out-Null
+}
+# ---------- /helpers ----------
 # === ENSURE events ===
 try { $fsw.EnableRaisingEvents = $false } catch {}
 try {
@@ -280,233 +394,3 @@ try {
 } catch { Log ("FATAL: {0}" -f $_) }
 # === /ENSURE events ===
 
-# ---------- Notion helpers v2 (cached lookup + robust status) ----------
-$global:__nt_headers = $null
-$global:__dbId = $null
-$global:__statusActive = $null
-$global:__statusDeleted = $null
-$global:__cachePath = 'C:\T18\.cache\notion_page_map.json'
-$global:__map = @{}
-
-function Ensure-Dir([string]$p){ $d=[IO.Path]::GetDirectoryName($p); if($d -and -not (Test-Path $d)){ New-Item -Type Directory $d | Out-Null } }
-
-function Load-Map {
-  try{
-    if(Test-Path $global:__cachePath){
-      $json = Get-Content -Raw $global:__cachePath
-      if($json){ $global:__map = $json | ConvertFrom-Json -AsHashtable }
-    }
-  } catch { $global:__map = @{} }
-}
-
-function Save-Map {
-  try{
-    Ensure-Dir $global:__cachePath
-    ($global:__map | ConvertTo-Json -Depth 6) | Set-Content -Encoding UTF8 $global:__cachePath
-  } catch { }
-}
-
-function Get-NotionHeaders {
-  if($null -ne $global:__nt_headers){ return $global:__nt_headers }
-  $token=[Environment]::GetEnvironmentVariable('NOTION_TOKEN','User')
-  $db=[Environment]::GetEnvironmentVariable('NOTION_DATABASE_ID','User')
-  if(-not $token -or -not $db){ throw "NOTION_TOKEN/DB missing" }
-  if($db -match '^[0-9a-fA-F]{32}$'){ $db = $db.Insert(20,'-').Insert(16,'-').Insert(12,'-').Insert(8,'-') }
-  $global:__dbId = $db
-  $global:__nt_headers = @{ Authorization="Bearer $token"; "Notion-Version"="2022-06-28"; "Content-Type"="application/json" }
-  return $global:__nt_headers
-}
-
-$global:__titleProp    = if($env:NOTION_TITLE_PROP){ $env:NOTION_TITLE_PROP } else { 'Path' }
-$global:__statusProp   = if($env:NOTION_PROP_STATUS){ $env:NOTION_PROP_STATUS } else { 'Status' }
-$global:__modifiedProp = if($env:NOTION_PROP_MODIFIED){ $env:NOTION_PROP_MODIFIED } else { 'Modified' }
-$global:__sizeProp     = if($env:NOTION_PROP_SIZE){ $env:NOTION_PROP_SIZE } else { 'Size' }
-
-function Normalize-Path([string]$p){ $p -replace '/', '\' }
-
-function Detect-StatusOptions {
-  if($global:__statusActive -and $global:__statusDeleted){ return }
-  $headers = Get-NotionHeaders
-  $db = $global:__dbId
-  try{
-    $dbInfo = Invoke-RestMethod -Method Get -Uri "https://api.notion.com/v1/databases/$db" -Headers $headers -ErrorAction Stop
-    $opts = $dbInfo.properties[$global:__statusProp].select.options
-    # pick ‘deleted’ (case-insensitive) and a default active-like option
-    $del = $opts | Where-Object { $_.name -match '^(?i)deleted$' } | Select-Object -First 1
-    if(-not $del){ $del = $opts | Where-Object { $_.name -match '(?i)del' } | Select-Object -First 1 }
-    $act = $opts | Where-Object { $_.name -match '^(?i)active$' } | Select-Object -First 1
-    if(-not $act){ $act = $opts | Where-Object { $_.name -match '(?i)present|current' } | Select-Object -First 1 }
-    $global:__statusDeleted = if($del){ $del.name } else { 'deleted' }
-    $global:__statusActive  = if($act){ $act.name } else { 'Active' }
-  } catch {
-    $global:__statusDeleted = 'deleted'
-    $global:__statusActive  = 'Active'
-  }
-}
-
-Load-Map
-Detect-StatusOptions
-
-function Find-PageId-FromCache([string]$path){
-  $k = Normalize-Path $path
-  if($global:__map.ContainsKey($k)){ return $global:__map[$k] }
-  return $null
-}
-
-function Put-PageId-ToCache([string]$path,[string]$pageId){
-  $k = Normalize-Path $path
-  $global:__map[$k] = $pageId
-  Save-Map
-}
-
-function Find-PageByTitle([string]$title,[int]$retries=4){
-  $headers = Get-NotionHeaders
-  $db = $global:__dbId
-  $title = Normalize-Path $title
-  for($i=0;$i -lt $retries;$i++){
-    try{
-      $body = @{ page_size=1; filter=@{ property=$global:__titleProp; title=@{ equals=$title } } } | ConvertTo-Json -Depth 10
-      $r = Invoke-RestMethod -Method Post -Uri "https://api.notion.com/v1/databases/$db/query" -Headers $headers -Body $body -ErrorAction Stop
-      if($r.results.Count -gt 0){ return $r.results[0] }
-    } catch { }
-    Start-Sleep -Milliseconds (400 + 200*$i)
-  }
-  return $null
-}
-
-function Ensure-PageForPath([string]$path){
-  $headers = Get-NotionHeaders
-  $db = $global:__dbId
-  $path = Normalize-Path $path
-
-  # 1) cache first
-  $cached = Find-PageId-FromCache $path
-  if($cached){ return $cached }
-
-  # 2) query Notion
-  $existing = Find-PageByTitle $path 3
-  if($existing){
-    Put-PageId-ToCache $path $existing.id
-    return $existing.id
-  }
-
-  # 3) create new
-  Detect-StatusOptions
-  $props = @{
-    ($global:__titleProp)    = @{ title=@(@{ text=@{ content=$path } }) }
-    ($global:__statusProp)   = @{ select=@{ name=$global:__statusActive } }
-    ($global:__sizeProp)     = @{ number = 0 }
-    ($global:__modifiedProp) = @{ date=@{ start=(Get-Date).ToUniversalTime().ToString('o') } }
-  }
-  $payload = @{ parent=@{ database_id=$db }; properties=$props } | ConvertTo-Json -Depth 10
-  $pg = Invoke-RestMethod -Method Post -Uri "https://api.notion.com/v1/pages" -Headers $headers -Body $payload -ErrorAction Stop
-  Put-PageId-ToCache $path $pg.id
-  return $pg.id
-}
-
-function Add-PreviewBlock([string]$pageGuid,[string]$path){
-  try{
-    $text = (Get-Content -LiteralPath $path -Raw -EA Stop)
-    if(-not $text){ return }
-    if($text.Length -gt 1800){ $text = $text.Substring(0,1800) }
-  } catch { return }
-
-  $lang='plain text'
-  switch -regex ($path){
-    '.*\.ps1$' { $lang='powershell' }
-    '.*\.py$'  { $lang='python' }
-    '.*\.cmd$' { $lang='shell' }
-    '.*\.(json|yml|yaml|toml)$' { $lang='markup' }
-    '.*\.md$'  { $lang='markdown' }
-  }
-  $headers = Get-NotionHeaders
-  $payload = @{ children = @(@{
-    object='block'; type='code'
-    code=@{ language=$lang; rich_text=@(@{ type='text'; text=@{ content=$text }}) }
-  }) } | ConvertTo-Json -Depth 10
-  Invoke-RestMethod -Method Patch -Uri ("https://api.notion.com/v1/blocks/{0}/children" -f $pageGuid) -Headers $headers -Body $payload -ErrorAction SilentlyContinue | Out-Null
-}
-
-function Upsert-ActiveWithPreview([string]$path){
-  $path = Normalize-Path $path
-  if(-not (Test-Path -LiteralPath $path)){ return }
-  Detect-StatusOptions
-  $pageGuid = Ensure-PageForPath $path
-  $headers = Get-NotionHeaders
-  $size = (Get-Item -EA SilentlyContinue $path).Length
-  $props = @{
-    ($global:__statusProp)   = @{ select=@{ name=$global:__statusActive } }
-    ($global:__sizeProp)     = @{ number = $size }
-    ($global:__modifiedProp) = @{ date=@{ start=(Get-Date).ToUniversalTime().ToString('o') } }
-  }
-  $patch = @{ properties = $props } | ConvertTo-Json -Depth 10
-  Invoke-RestMethod -Method Patch -Uri ("https://api.notion.com/v1/pages/{0}" -f $pageGuid) -Headers $headers -Body $patch -ErrorAction SilentlyContinue | Out-Null
-  Add-PreviewBlock $pageGuid $path
-  Log ("SYNCED: {0} size={1}" -f $path, $size)
-}
-
-function Mark-DeletedSafe([string]$path){
-  $path = Normalize-Path $path
-  Detect-StatusOptions
-  $headers = Get-NotionHeaders
-
-  # prefer cache
-  $pageGuid = Find-PageId-FromCache $path
-
-  if(-not $pageGuid){
-    $page = Find-PageByTitle $path 6
-    if($page){ $pageGuid = $page.id }
-  }
-  if(-not $pageGuid){
-    Log ("DELETE TOMB?: row not found for {0}" -f $path)
-    $pageGuid = Ensure-PageForPath $path   # create tombstone
-  }
-
-  $props = @{
-    ($global:__statusProp)   = @{ select=@{ name=$global:__statusDeleted } }
-    ($global:__sizeProp)     = @{ number = 0 }
-    ($global:__modifiedProp) = @{ date=@{ start=(Get-Date).ToUniversalTime().ToString('o') } }
-  }
-  $patch = @{ properties=$props } | ConvertTo-Json -Depth 10
-  Invoke-RestMethod -Method Patch -Uri ("https://api.notion.com/v1/pages/{0}" -f $pageGuid) -Headers $headers -Body $patch -ErrorAction SilentlyContinue | Out-Null
-
-  # ensure cache has mapping (useful if we came via tombstone)
-  Put-PageId-ToCache $path $pageGuid
-}
-# ---------- /helpers v2 ----------
-# === ENSURE events v2 ===
-try { $fsw.EnableRaisingEvents = $false } catch {}
-try {
-  if(-not $fsw){
-    $fsw = New-Object IO.FileSystemWatcher 'C:\T18'
-    $fsw.IncludeSubdirectories = $true
-    $fsw.Filter='*'
-    $fsw.NotifyFilter = [IO.NotifyFilters]::FileName -bor `
-                        [IO.NotifyFilters]::LastWrite -bor `
-                        [IO.NotifyFilters]::Size
-    $fsw.InternalBufferSize = 65536
-  }
-  'FS-C','FS-U','FS-D','FS-R' | % { Unregister-Event -SourceIdentifier $_ -ErrorAction SilentlyContinue }
-  function __sz($p){ try { (Get-Item -EA SilentlyContinue $p).Length } catch { 0 } }
-
-  $null = Register-ObjectEvent $fsw Created 'FS-C' -Action {
-    $p = $Event.SourceEventArgs.FullPath
-    if(-not (Is-Excluded $p)){ Log ("CREATED: {0} size={1}" -f $p, (__sz $p)); Upsert-ActiveWithPreview $p }
-  }
-  $null = Register-ObjectEvent $fsw Changed 'FS-U' -Action {
-    $p = $Event.SourceEventArgs.FullPath
-    if(-not (Is-Excluded $p)){ Log ("UPDATED: {0} size={1}" -f $p, (__sz $p)); Upsert-ActiveWithPreview $p }
-  }
-  $null = Register-ObjectEvent $fsw Deleted 'FS-D' -Action {
-    $p = $Event.SourceEventArgs.FullPath
-    if(-not (Is-Excluded $p)){ Log ("DELETED: {0}" -f $p); Mark-DeletedSafe $p }
-  }
-  $null = Register-ObjectEvent $fsw Renamed 'FS-R' -Action {
-    $old = $Event.SourceEventArgs.OldFullPath; $new = $Event.SourceEventArgs.FullPath
-    if(-not (Is-Excluded $old)){ Log ("RENAMED FROM: {0}" -f $old); Mark-DeletedSafe $old }
-    if(-not (Is-Excluded $new)){ Log ("RENAMED TO:   {0}" -f $new); Upsert-ActiveWithPreview $new }
-  }
-  $fsw.EnableRaisingEvents = $true
-  Log ("watching C:\T18 ...")
-} catch { Log ("FATAL: {0}" -f $_) }
-# === /ENSURE events v2 ===
