@@ -2,21 +2,31 @@ $ErrorActionPreference = "Stop"
 
 # ===== CONFIG =====
 $Root = "C:\T18"
-$ExcludePatterns = @('\_quarantine_', '\teevra18\data\parquet\', '\.git\', '\.venv\', '\.locks\', '\.streamlit\', '\logs\')
-
-# Notion config (env-driven; title prop is Path per your DB)
-$token = [Environment]::GetEnvironmentVariable("NOTION_TOKEN","User")
-$db    = [Environment]::GetEnvironmentVariable("NOTION_DATABASE_ID","User")
-if(!$token -or !$db){ throw "NOTION_TOKEN / NOTION_DATABASE_ID missing (User scope)" }
-if($db -match "^[0-9a-fA-F]{32}$"){ $db = $db.Insert(20,"-").Insert(16,"-").Insert(12,"-").Insert(8,"-") }
-
-$titleProp    = ([Environment]::GetEnvironmentVariable("NOTION_TITLE_PROP","User"));    if(!$titleProp){    $titleProp="Path" }
-$gitTracked   = ([Environment]::GetEnvironmentVariable("NOTION_PROP_GITTRACKED","User"));if(!$gitTracked){  $gitTracked="Git Tracked" }
-$modifiedProp = ([Environment]::GetEnvironmentVariable("NOTION_PROP_MODIFIED","User"));  if(!$modifiedProp){ $modifiedProp="Modified" }
-$sizeProp     = ([Environment]::GetEnvironmentVariable("NOTION_PROP_SIZE","User"));      if(!$sizeProp){     $sizeProp="Size" }
-$statusProp   = ([Environment]::GetEnvironmentVariable("NOTION_PROP_STATUS","User"));    if(!$statusProp){   $statusProp="Status" }
-$activeVal    = ([Environment]::GetEnvironmentVariable("NOTION_STATUS_VALUE","User"));   if(!$activeVal){    $activeVal="Active" }
+$ExcludePatterns = @(
+  '*\_quarantine\*',
+  '*\teevra18\data\parquet\*',
+  '*\.git\*',
+  '*\.venv\*',
+  '*\.locks\*',
+  '*\.streamlit\*',
+  '*\logs\*'
+)$titleProp    = "Path"
+$statusProp   = "Status"
+$modifiedProp = "Modified"
+$sizeProp     = "Size"
+$activeVal    = "Active"
 $deletedVal   = "deleted"
+
+# ===== ENV (prefer User, then Machine) =====
+function Get-Env([string]$name){
+  $u=[Environment]::GetEnvironmentVariable($name,'User')
+  if([string]::IsNullOrWhiteSpace($u)){ return [Environment]::GetEnvironmentVariable($name,'Machine') }
+  return $u
+}
+$token = Get-Env 'NOTION_TOKEN'
+$db    = Get-Env 'NOTION_DATABASE_ID'
+if(-not $token -or -not $db){ throw "NOTION_TOKEN / NOTION_DATABASE_ID missing" }
+if($db -match '^[0-9a-fA-F]{32}$'){ $db = $db.Insert(20,'-').Insert(16,'-').Insert(12,'-').Insert(8,'-') }
 
 $headers = @{
   Authorization    = "Bearer $token"
@@ -25,488 +35,273 @@ $headers = @{
 }
 
 # ===== LOGGING =====
-$logDir = Join-Path $Root "logs"
-if(!(Test-Path $logDir)){ New-Item -Type Directory $logDir | Out-Null }
-$log    = Join-Path $logDir "ps_watcher.log"
-function Log([string]$msg){ "[{0}] {1}" -f ((Get-Date).ToString("s")), $msg | Add-Content -Path $log }
+$logDir = 'C:\T18\logs'
+if(-not (Test-Path $logDir)){ New-Item -Type Directory $logDir | Out-Null }
+$log = Join-Path $logDir 'ps_watcher.log'
+function Log([string]$m){ ("[{0}] {1}" -f ((Get-Date).ToString('s')), $m) | Add-Content $log }
+
+# ===== SINGLE INSTANCE LOCK =====
+$lock = "C:\T18\.locks\ps_watcher_single.lock"
+if(-not (Test-Path (Split-Path $lock))){ New-Item -Type Directory (Split-Path $lock) | Out-Null }
+try{
+  $fs = [System.IO.File]::Open($lock,'OpenOrCreate','ReadWrite','None')
+} catch {
+  Log "[ps_watcher] Another instance detected. Exiting."
+  exit 0
+}
+
+# ===== SMALL PAGE-ID CACHE =====
+$cacheDir  = "C:\T18\.cache"; if(-not (Test-Path $cacheDir)){ New-Item -Type Directory $cacheDir | Out-Null }
+$cachePath = Join-Path $cacheDir "ps_watcher_index.json"
+if(-not (Test-Path $cachePath)){ '{}' | Set-Content -Encoding UTF8 $cachePath }
+
+function Load-Index { try { Get-Content -Raw -EA Stop $cachePath | ConvertFrom-Json } catch { @{} } }
+function Save-Index($idx){ ($idx | ConvertTo-Json -Depth 5) | Set-Content -Encoding UTF8 $cachePath }
+function Remember-PageId([string]$path,[string]$pageId){ $idx=Load-Index; $idx[$path]=$pageId; Save-Index $idx }
+function Get-RememberedId([string]$path){ $idx=Load-Index; if($idx.ContainsKey($path)){ return [string]$idx[$path] } return $null }
 
 # ===== HELPERS =====
-function Is-Excluded([string]$path){
-  $p = $path.ToLower()
-  foreach($pat in $ExcludePatterns){
-    if($p -like "*$pat*".ToLower()){ return $true }
+function Is-Excluded([string]){
+  if (-not ) { return $false }
+  $np = .ToLower()
+  if ($np -like '*\logs\*') { return $true }   # hard guard
+  foreach ($w in $ExcludePatterns) {
+    if ($np -ilike $w) { return $true }
   }
   return $false
 }
+  foreach($rx in $ExcludePatterns){ if($np -match $rx){ return $true } }
+  return $false
+}
+function UtcNow(){ (Get-Date).ToUniversalTime().ToString('o') }
 
-function _utc(){ (Get-Date).ToUniversalTime().ToString("o") }   # ISO8601Z
-
-function Find-PageByTitle([string]$title){
-  $body = @{
-    page_size = 1
-    filter    = @{ property=$titleProp; title=@{ equals=$title } }
-  } | ConvertTo-Json -Depth 10
-  (Invoke-RestMethod -Method Post -Uri "https://api.notion.com/v1/databases/$db/query" -Headers $headers -Body $body -EA Stop).results
+function Find-ByPathExact([string]$path, [int]$tries=6, [int]$sleepMs=600){
+  for($i=0;$i -lt $tries;$i++){
+    try{
+      $b = @{ page_size=1; filter=@{ property=$titleProp; title=@{ equals=$path } } } | ConvertTo-Json -Depth 10
+      $r = Invoke-RestMethod -Method Post -Uri "https://api.notion.com/v1/databases/$db/query" -Headers $headers -Body $b -EA Stop
+      if($r.results.Count -gt 0){ return $r.results[0] }
+    } catch {}
+    Start-Sleep -Milliseconds $sleepMs
+  }
+  return $null
 }
 
-function Ensure-Page([string]$title){
-  $r = Find-PageByTitle $title
-  if($r.Count -gt 0){ return $r[0].id }
-  $payload = @{
-    parent     = @{ database_id = $db }
-    properties = @{
-      $titleProp    = @{ title   = @(@{ text=@{ content=$title }}) }
-      $statusProp   = @{ select  = @{ name=$activeVal } }
-      $gitTracked   = @{ checkbox = $false }
-      $sizeProp     = @{ number  = 0 }
-      $modifiedProp = @{ date    = @{ start = (_utc) } }
+function Search-Anywhere([string]$path){
+  try{
+    $b = @{ query=$path; page_size=5; filter=@{ value="page"; property="object" } } | ConvertTo-Json -Depth 10
+    $r = Invoke-RestMethod -Method Post -Uri "https://api.notion.com/v1/search" -Headers $headers -Body $b -EA Stop
+    foreach($pg in $r.results){
+      try{
+        if($pg.parent.type -eq "database_id" -and $pg.parent.database_id -eq $db){
+          $t = ($pg.properties.$titleProp.title.plain_text -join '')
+          if($t -eq $path){ return $pg }
+        }
+      } catch {}
     }
-  } | ConvertTo-Json -Depth 10
-  $resp = Invoke-RestMethod -Method Post -Uri "https://api.notion.com/v1/pages" -Headers $headers -Body $payload -EA Stop
-  return $resp.id
-}
-
-function Update-Props([string]$pageId, [hashtable]$props){
-  $patch = @{ properties = $props } | ConvertTo-Json -Depth 10
-  Invoke-RestMethod -Method Patch -Uri ("https://api.notion.com/v1/pages/{0}" -f $pageId) -Headers $headers -Body $patch -EA Stop | Out-Null
+  } catch {}
+  return $null
 }
 
 function Add-PreviewBlock([string]$pageId, [string]$path){
-  # Only try for small-ish text files
-  try{
-    if(!(Test-Path -LiteralPath $path)){ return }
-    $fi = Get-Item -LiteralPath $path -EA Stop
-    if($fi.Length -gt 524288){ return }  # >512 KB: skip preview
-    $text = Get-Content -LiteralPath $path -Raw -EA Stop
-    if(!$text){ return }
-    if($text.Length -gt 1800){ $text = $text.Substring(0,1800) }
-  } catch { return }
-
-  $lang = "plain text"
-  switch -regex ($path){
-    ".*\.ps1$"                  { $lang = "powershell" }
-    ".*\.py$"                   { $lang = "python" }
-    ".*\.cmd$"                  { $lang = "shell" }
-    ".*\.(json|yml|yaml|toml)$" { $lang = "markup" }
-    ".*\.md$"                   { $lang = "markdown" }
-    ".*\.(txt|log)$"            { $lang = "plain text" }
-  }
-
-  $payload = @{
-    children = @(@{
-      object = "block"
-      type   = "code"
-      code   = @{
-        language  = $lang
-        rich_text = @(@{ type="text"; text=@{ content=$text } })
-      }
-    })
-  } | ConvertTo-Json -Depth 10
-
-  Invoke-RestMethod -Method Patch `
-    -Uri ("https://api.notion.com/v1/blocks/{0}/children" -f $pageId) `
-    -Headers $headers -Body $payload -EA SilentlyContinue | Out-Null
-}
-
-function Sync-File([string]$path){
-  if(Is-Excluded $path){ return }
-  try{
-    if(!(Test-Path -LiteralPath $path)){ return } # file may have vanished
-    $size = (Get-Item -LiteralPath $path -EA Stop).Length
-  } catch { $size = 0 }
-
-  $pageId = Ensure-Page $path
-
-  # Update basic props
-  $props = @{
-    $titleProp    = @{ title = @(@{ text=@{ content=$path }}) }
-    $statusProp   = @{ select = @{ name=$activeVal } }
-    $sizeProp     = @{ number = [double]$size }
-    $modifiedProp = @{ date   = @{ start = (_utc) } }
-  }
-  Update-Props $pageId $props
-
-  # Add/refresh preview block for text-like files
-  if($path -match "\.(txt|md|log|ps1|py|cmd|bat|json|yml|yaml|toml)$"){
-    Add-PreviewBlock $pageId $path
-  }
-
-  Log ("SYNCED: {0} size={1}" -f $path, $size)
-}
-
-function Mark-Deleted([string]$title){
-  if(Is-Excluded $title){ return }
-  $r = Find-PageByTitle $title
-  if($r.Count -gt 0){
-    $pageId = $r[0].id  # DO NOT name this $PID (PowerShell reserved)
-    $props = @{
-      $titleProp    = @{ title = @(@{ text=@{ content=$title }}) }
-      $statusProp   = @{ select = @{ name=$deletedVal } }
-      $modifiedProp = @{ date   = @{ start = (_utc) } }
-      $sizeProp     = @{ number = 0 }
-    }
-    Update-Props $pageId $props
-    Log ("MARKED DELETED: {0}" -f $title)
-  } else {
-    Log ("DELETE TOMB?: row not found for {0}" -f $title)
-  }
-}
-
-# ===== FILESYSTEM WATCHER =====
-try{ $fsw.EnableRaisingEvents = $false } catch {}
-
-$fsw = New-Object IO.FileSystemWatcher $Root
-$fsw.IncludeSubdirectories = $true
-$fsw.Filter = "*"
-$fsw.NotifyFilter = [IO.NotifyFilters]::FileName -bor `
-                    [IO.NotifyFilters]::LastWrite -bor `
-                    [IO.NotifyFilters]::Size
-$fsw.InternalBufferSize = 65536
-
-# small debounce for noisy editors
-$last = @{}  # path -> ticks
-function _bounce([string]$p){
-  $now = [DateTime]::UtcNow.Ticks
-  if($last.ContainsKey($p)){
-    if(($now - $last[$p]) -lt [TimeSpan]::FromMilliseconds(1500).Ticks){ return $true }
-    $last[$p] = $now; return $false
-  } else { $last[$p] = $now; return $false }
-}
-
-# Events
-$null = Register-ObjectEvent -InputObject $fsw -EventName Created -SourceIdentifier "FS-C" -Action {
-  $p = $Event.SourceEventArgs.FullPath
-  if(!(Is-Excluded $p)){ Log ("CREATED: {0} size={1}" -f $p, (Get-Item -EA SilentlyContinue $p).Length); Sync-File $p }
-}
-$null = Register-ObjectEvent -InputObject $fsw -EventName Changed -SourceIdentifier "FS-U" -Action {
-  $p = $Event.SourceEventArgs.FullPath
-  if(!(Is-Excluded $p) -and -not (_bounce $p)){ Log ("UPDATED: {0} size={1}" -f $p, (Get-Item -EA SilentlyContinue $p).Length); Sync-File $p }
-}
-$null = Register-ObjectEvent -InputObject $fsw -EventName Deleted -SourceIdentifier "FS-D" -Action {
-  $p = $Event.SourceEventArgs.FullPath
-  if(!(Is-Excluded $p)){ Log ("DELETED: {0}" -f $p); Mark-Deleted $p }
-}
-$null = Register-ObjectEvent -InputObject $fsw -EventName Renamed -SourceIdentifier "FS-R" -Action {
-  $old = $Event.SourceEventArgs.OldFullPath
-  $new = $Event.SourceEventArgs.FullPath
-  if(!(Is-Excluded $old)){ Log ("RENAMED FROM: {0}" -f $old); Mark-Deleted $old }
-  if(!(Is-Excluded $new)){ Log ("RENAMED TO:   {0}" -f $new);  Sync-File  $new }
-}
-
-$fsw.EnableRaisingEvents = $true
-Log ("watching {0} ..." -f $Root)
-
-# keep alive
-while($true){ Wait-Event -Timeout 2 | Out-Null }
-
-# === ENSURE FSW EVENTS (create/update/delete/rename) ===========================
-try { $fsw.EnableRaisingEvents = $false } catch {}
-try {
-  if(-not $fsw){
-    $fsw = New-Object IO.FileSystemWatcher 'C:\T18'
-    $fsw.IncludeSubdirectories = $true
-    $fsw.Filter = '*'
-    $fsw.NotifyFilter = [IO.NotifyFilters]::FileName -bor `
-                        [IO.NotifyFilters]::LastWrite -bor `
-                        [IO.NotifyFilters]::Size
-    $fsw.InternalBufferSize = 65536
-  }
-
-  function __sz($p){ try { (Get-Item -EA SilentlyContinue $p).Length } catch { 0 } }
-
-  # De-dup registrations if they already exist
-  'FS-C','FS-U','FS-D','FS-R' | ForEach-Object { Unregister-Event -SourceIdentifier $_ -ErrorAction SilentlyContinue }
-
-  $null = Register-ObjectEvent -InputObject $fsw -EventName Created -SourceIdentifier 'FS-C' -Action {
-    $p = $Event.SourceEventArgs.FullPath
-    if(-not (Is-Excluded $p)){ Log ("CREATED: {0} size={1}" -f $p, (__sz $p)); Upsert-ActiveWithPreview $p }
-  }
-  $null = Register-ObjectEvent -InputObject $fsw -EventName Changed -SourceIdentifier 'FS-U' -Action {
-    $p = $Event.SourceEventArgs.FullPath
-    if(-not (Is-Excluded $p)){ Log ("UPDATED: {0} size={1}" -f $p, (__sz $p)); Upsert-ActiveWithPreview $p }
-  }
-  $null = Register-ObjectEvent -InputObject $fsw -EventName Deleted -SourceIdentifier 'FS-D' -Action {
-    $p = $Event.SourceEventArgs.FullPath
-    if(-not (Is-Excluded $p)){ Log ("DELETED: {0}" -f $p); Mark-DeletedSafe $p }
-  }
-  $null = Register-ObjectEvent -InputObject $fsw -EventName Renamed -SourceIdentifier 'FS-R' -Action {
-    $old = $Event.SourceEventArgs.OldFullPath
-    $new = $Event.SourceEventArgs.FullPath
-    if(-not (Is-Excluded $old)){ Log ("RENAMED FROM: {0}" -f $old); Mark-DeletedSafe $old }
-    if(-not (Is-Excluded $new)){ Log ("RENAMED TO:   {0}" -f $new); Upsert-ActiveWithPreview $new }
-  }
-
-  $fsw.EnableRaisingEvents = $true
-  Log ("watching C:\T18 ...")
-} catch {
-  Log ("FATAL: {0}" -f $_)
-}
-# === /ENSURE ===================================================================
-
-# === ENSURE events ===
-try { $fsw.EnableRaisingEvents = $false } catch {}
-try {
-  if(-not $fsw){
-    $fsw = New-Object IO.FileSystemWatcher 'C:\T18'
-    $fsw.IncludeSubdirectories = $true
-    $fsw.Filter='*'
-    $fsw.NotifyFilter = [IO.NotifyFilters]::FileName -bor `
-                        [IO.NotifyFilters]::LastWrite -bor `
-                        [IO.NotifyFilters]::Size
-    $fsw.InternalBufferSize = 65536
-  }
-  'FS-C','FS-U','FS-D','FS-R' | % { Unregister-Event -SourceIdentifier $_ -ErrorAction SilentlyContinue }
-  function __sz($p){ try { (Get-Item -EA SilentlyContinue $p).Length } catch { 0 } }
-
-  $null = Register-ObjectEvent $fsw Created 'FS-C' -Action {
-    $p = $Event.SourceEventArgs.FullPath
-    if(-not (Is-Excluded $p)){ Log ("CREATED: {0} size={1}" -f $p, (__sz $p)); Upsert-ActiveWithPreview $p }
-  }
-  $null = Register-ObjectEvent $fsw Changed 'FS-U' -Action {
-    $p = $Event.SourceEventArgs.FullPath
-    if(-not (Is-Excluded $p)){ Log ("UPDATED: {0} size={1}" -f $p, (__sz $p)); Upsert-ActiveWithPreview $p }
-  }
-  $null = Register-ObjectEvent $fsw Deleted 'FS-D' -Action {
-    $p = $Event.SourceEventArgs.FullPath
-    if(-not (Is-Excluded $p)){ Log ("DELETED: {0}" -f $p); Mark-DeletedSafe $p }
-  }
-  $null = Register-ObjectEvent $fsw Renamed 'FS-R' -Action {
-    $old = $Event.SourceEventArgs.OldFullPath; $new = $Event.SourceEventArgs.FullPath
-    if(-not (Is-Excluded $old)){ Log ("RENAMED FROM: {0}" -f $old); Mark-DeletedSafe $old }
-    if(-not (Is-Excluded $new)){ Log ("RENAMED TO:   {0}" -f $new); Upsert-ActiveWithPreview $new }
-  }
-  $fsw.EnableRaisingEvents = $true
-  Log ("watching C:\T18 ...")
-} catch { Log ("FATAL: {0}" -f $_) }
-# === /ENSURE events ===
-
-# ---------- Notion helpers v2 (cached lookup + robust status) ----------
-$global:__nt_headers = $null
-$global:__dbId = $null
-$global:__statusActive = $null
-$global:__statusDeleted = $null
-$global:__cachePath = 'C:\T18\.cache\notion_page_map.json'
-$global:__map = @{}
-
-function Ensure-Dir([string]$p){ $d=[IO.Path]::GetDirectoryName($p); if($d -and -not (Test-Path $d)){ New-Item -Type Directory $d | Out-Null } }
-
-function Load-Map {
-  try{
-    if(Test-Path $global:__cachePath){
-      $json = Get-Content -Raw $global:__cachePath
-      if($json){ $global:__map = $json | ConvertFrom-Json -AsHashtable }
-    }
-  } catch { $global:__map = @{} }
-}
-
-function Save-Map {
-  try{
-    Ensure-Dir $global:__cachePath
-    ($global:__map | ConvertTo-Json -Depth 6) | Set-Content -Encoding UTF8 $global:__cachePath
-  } catch { }
-}
-
-function Get-NotionHeaders {
-  if($null -ne $global:__nt_headers){ return $global:__nt_headers }
-  $token=[Environment]::GetEnvironmentVariable('NOTION_TOKEN','User')
-  $db=[Environment]::GetEnvironmentVariable('NOTION_DATABASE_ID','User')
-  if(-not $token -or -not $db){ throw "NOTION_TOKEN/DB missing" }
-  if($db -match '^[0-9a-fA-F]{32}$'){ $db = $db.Insert(20,'-').Insert(16,'-').Insert(12,'-').Insert(8,'-') }
-  $global:__dbId = $db
-  $global:__nt_headers = @{ Authorization="Bearer $token"; "Notion-Version"="2022-06-28"; "Content-Type"="application/json" }
-  return $global:__nt_headers
-}
-
-$global:__titleProp    = if($env:NOTION_TITLE_PROP){ $env:NOTION_TITLE_PROP } else { 'Path' }
-$global:__statusProp   = if($env:NOTION_PROP_STATUS){ $env:NOTION_PROP_STATUS } else { 'Status' }
-$global:__modifiedProp = if($env:NOTION_PROP_MODIFIED){ $env:NOTION_PROP_MODIFIED } else { 'Modified' }
-$global:__sizeProp     = if($env:NOTION_PROP_SIZE){ $env:NOTION_PROP_SIZE } else { 'Size' }
-
-function Normalize-Path([string]$p){ $p -replace '/', '\' }
-
-function Detect-StatusOptions {
-  if($global:__statusActive -and $global:__statusDeleted){ return }
-  $headers = Get-NotionHeaders
-  $db = $global:__dbId
-  try{
-    $dbInfo = Invoke-RestMethod -Method Get -Uri "https://api.notion.com/v1/databases/$db" -Headers $headers -ErrorAction Stop
-    $opts = $dbInfo.properties[$global:__statusProp].select.options
-    # pick ‘deleted’ (case-insensitive) and a default active-like option
-    $del = $opts | Where-Object { $_.name -match '^(?i)deleted$' } | Select-Object -First 1
-    if(-not $del){ $del = $opts | Where-Object { $_.name -match '(?i)del' } | Select-Object -First 1 }
-    $act = $opts | Where-Object { $_.name -match '^(?i)active$' } | Select-Object -First 1
-    if(-not $act){ $act = $opts | Where-Object { $_.name -match '(?i)present|current' } | Select-Object -First 1 }
-    $global:__statusDeleted = if($del){ $del.name } else { 'deleted' }
-    $global:__statusActive  = if($act){ $act.name } else { 'Active' }
-  } catch {
-    $global:__statusDeleted = 'deleted'
-    $global:__statusActive  = 'Active'
-  }
-}
-
-Load-Map
-Detect-StatusOptions
-
-function Find-PageId-FromCache([string]$path){
-  $k = Normalize-Path $path
-  if($global:__map.ContainsKey($k)){ return $global:__map[$k] }
-  return $null
-}
-
-function Put-PageId-ToCache([string]$path,[string]$pageId){
-  $k = Normalize-Path $path
-  $global:__map[$k] = $pageId
-  Save-Map
-}
-
-function Find-PageByTitle([string]$title,[int]$retries=4){
-  $headers = Get-NotionHeaders
-  $db = $global:__dbId
-  $title = Normalize-Path $title
-  for($i=0;$i -lt $retries;$i++){
-    try{
-      $body = @{ page_size=1; filter=@{ property=$global:__titleProp; title=@{ equals=$title } } } | ConvertTo-Json -Depth 10
-      $r = Invoke-RestMethod -Method Post -Uri "https://api.notion.com/v1/databases/$db/query" -Headers $headers -Body $body -ErrorAction Stop
-      if($r.results.Count -gt 0){ return $r.results[0] }
-    } catch { }
-    Start-Sleep -Milliseconds (400 + 200*$i)
-  }
-  return $null
-}
-
-function Ensure-PageForPath([string]$path){
-  $headers = Get-NotionHeaders
-  $db = $global:__dbId
-  $path = Normalize-Path $path
-
-  # 1) cache first
-  $cached = Find-PageId-FromCache $path
-  if($cached){ return $cached }
-
-  # 2) query Notion
-  $existing = Find-PageByTitle $path 3
-  if($existing){
-    Put-PageId-ToCache $path $existing.id
-    return $existing.id
-  }
-
-  # 3) create new
-  Detect-StatusOptions
-  $props = @{
-    ($global:__titleProp)    = @{ title=@(@{ text=@{ content=$path } }) }
-    ($global:__statusProp)   = @{ select=@{ name=$global:__statusActive } }
-    ($global:__sizeProp)     = @{ number = 0 }
-    ($global:__modifiedProp) = @{ date=@{ start=(Get-Date).ToUniversalTime().ToString('o') } }
-  }
-  $payload = @{ parent=@{ database_id=$db }; properties=$props } | ConvertTo-Json -Depth 10
-  $pg = Invoke-RestMethod -Method Post -Uri "https://api.notion.com/v1/pages" -Headers $headers -Body $payload -ErrorAction Stop
-  Put-PageId-ToCache $path $pg.id
-  return $pg.id
-}
-
-function Add-PreviewBlock([string]$pageGuid,[string]$path){
   try{
     $text = (Get-Content -LiteralPath $path -Raw -EA Stop)
-    if(-not $text){ return }
+    if([string]::IsNullOrEmpty($text)){ return }
     if($text.Length -gt 1800){ $text = $text.Substring(0,1800) }
   } catch { return }
-
   $lang='plain text'
-  switch -regex ($path){
-    '.*\.ps1$' { $lang='powershell' }
-    '.*\.py$'  { $lang='python' }
-    '.*\.cmd$' { $lang='shell' }
-    '.*\.(json|yml|yaml|toml)$' { $lang='markup' }
-    '.*\.md$'  { $lang='markdown' }
-  }
-  $headers = Get-NotionHeaders
+  if($path -match '\.ps1$'){ $lang='powershell' }
+  elseif($path -match '\.py$'){ $lang='python' }
+  elseif($path -match '\.cmd$'){ $lang='shell' }
+  elseif($path -match '\.(json|ya?ml|toml)$'){ $lang='markup' }
+  elseif($path -match '\.md$'){ $lang='markdown' }
+
   $payload = @{ children = @(@{
     object='block'; type='code'
     code=@{ language=$lang; rich_text=@(@{ type='text'; text=@{ content=$text }}) }
   }) } | ConvertTo-Json -Depth 10
-  Invoke-RestMethod -Method Patch -Uri ("https://api.notion.com/v1/blocks/{0}/children" -f $pageGuid) -Headers $headers -Body $payload -ErrorAction SilentlyContinue | Out-Null
+
+  Invoke-RestMethod -Method Patch ("https://api.notion.com/v1/blocks/{0}/children" -f $pageId) -Headers $headers -Body $payload -EA SilentlyContinue | Out-Null
 }
 
-function Upsert-ActiveWithPreview([string]$path){
-  $path = Normalize-Path $path
-  if(-not (Test-Path -LiteralPath $path)){ return }
-  Detect-StatusOptions
-  $pageGuid = Ensure-PageForPath $path
-  $headers = Get-NotionHeaders
-  $size = (Get-Item -EA SilentlyContinue $path).Length
+# ===== CORE SYNC =====
+function Upsert-Active([string]$path){
+  try{ $size = (Get-Item -EA Stop $path).Length } catch { return }
+  $pageId = Get-RememberedId $path
+  if(-not $pageId){
+    $pg = Find-ByPathExact $path 5 500
+    if(-not $pg){ $pg = Search-Anywhere $path }
+    if($pg){ $pageId=$pg.id; Remember-PageId $path $pageId }
+  }
+  if(-not $pageId){
+    $props = @{
+      $titleProp    = @{ title=@(@{ text=@{ content=$path }}) }
+      $statusProp   = @{ select=@{ name=$activeVal } }
+      $sizeProp     = @{ number=$size }
+      $modifiedProp = @{ date=@{ start=(UtcNow) } }
+    }
+    $payload = @{ parent=@{ database_id=$db }; properties=$props } | ConvertTo-Json -Depth 10
+    $new = Invoke-RestMethod -Method Post -Uri "https://api.notion.com/v1/pages" -Headers $headers -Body $payload -EA SilentlyContinue
+    if($new -and $new.id){ $pageId=$new.id; Remember-PageId $path $pageId }
+  } else {
+    $patch = @{ properties=@{
+      $statusProp   = @{ select=@{ name=$activeVal } }
+      $sizeProp     = @{ number=$size }
+      $modifiedProp = @{ date=@{ start=(UtcNow) } }
+    }} | ConvertTo-Json -Depth 10
+    Invoke-RestMethod -Method Patch -Uri ("https://api.notion.com/v1/pages/{0}" -f $pageId) -Headers $headers -Body $patch -EA SilentlyContinue | Out-Null
+  }
+  if($pageId){ try{ Add-PreviewBlock $pageId $path } catch {} }
+  Log ("SYNCED: {0} size={1}" -f $path,$size)
+}
+
+function Tombstone([string]$path){
+  $pageId = Get-RememberedId $path
+  if(-not $pageId){
+    $pg = Find-ByPathExact $path 8 600
+    if(-not $pg){ $pg = Search-Anywhere $path }
+    if($pg){ $pageId=$pg.id; Remember-PageId $path $pageId }
+  }
+  if($pageId){
+    $patch = @{ properties=@{
+      $statusProp   = @{ select=@{ name=$deletedVal } }
+      $sizeProp     = @{ number=0 }
+      $modifiedProp = @{ date=@{ start=(UtcNow) } }
+    }} | ConvertTo-Json -Depth 10
+    try{
+      Invoke-RestMethod -Method Patch -Uri ("https://api.notion.com/v1/pages/{0}" -f $pageId) -Headers $headers -Body $patch -EA Stop | Out-Null
+      Log ("TOMBSTONED: {0}" -f $path)
+      return
+    } catch {
+      Log ("DELETE PATCH FAILED: {0} :: {1}" -f $path, $_)
+    }
+  }
+  # fallback: create deleted row so the UI is always correct
   $props = @{
-    ($global:__statusProp)   = @{ select=@{ name=$global:__statusActive } }
-    ($global:__sizeProp)     = @{ number = $size }
-    ($global:__modifiedProp) = @{ date=@{ start=(Get-Date).ToUniversalTime().ToString('o') } }
+    $titleProp    = @{ title=@(@{ text=@{ content=$path }}) }
+    $statusProp   = @{ select=@{ name=$deletedVal } }
+    $sizeProp     = @{ number=0 }
+    $modifiedProp = @{ date=@{ start=(UtcNow) } }
   }
-  $patch = @{ properties = $props } | ConvertTo-Json -Depth 10
-  Invoke-RestMethod -Method Patch -Uri ("https://api.notion.com/v1/pages/{0}" -f $pageGuid) -Headers $headers -Body $patch -ErrorAction SilentlyContinue | Out-Null
-  Add-PreviewBlock $pageGuid $path
-  Log ("SYNCED: {0} size={1}" -f $path, $size)
+  try{
+    $payload = @{ parent=@{ database_id=$db }; properties=$props } | ConvertTo-Json -Depth 10
+    $new = Invoke-RestMethod -Method Post -Uri "https://api.notion.com/v1/pages" -Headers $headers -Body $payload -EA Stop
+    if($new -and $new.id){ Remember-PageId $path $new.id }
+    Log ("TOMBSTONE UPSERT: {0}" -f $path)
+  } catch {
+    Log ("DELETE TOMB (create failed): {0} :: {1}" -f $path, $_)
+  }
 }
 
-function Mark-DeletedSafe([string]$path){
-  $path = Normalize-Path $path
-  Detect-StatusOptions
-  $headers = Get-NotionHeaders
-
-  # prefer cache
-  $pageGuid = Find-PageId-FromCache $path
-
-  if(-not $pageGuid){
-    $page = Find-PageByTitle $path 6
-    if($page){ $pageGuid = $page.id }
-  }
-  if(-not $pageGuid){
-    Log ("DELETE TOMB?: row not found for {0}" -f $path)
-    $pageGuid = Ensure-PageForPath $path   # create tombstone
-  }
-
-  $props = @{
-    ($global:__statusProp)   = @{ select=@{ name=$global:__statusDeleted } }
-    ($global:__sizeProp)     = @{ number = 0 }
-    ($global:__modifiedProp) = @{ date=@{ start=(Get-Date).ToUniversalTime().ToString('o') } }
-  }
-  $patch = @{ properties=$props } | ConvertTo-Json -Depth 10
-  Invoke-RestMethod -Method Patch -Uri ("https://api.notion.com/v1/pages/{0}" -f $pageGuid) -Headers $headers -Body $patch -ErrorAction SilentlyContinue | Out-Null
-
-  # ensure cache has mapping (useful if we came via tombstone)
-  Put-PageId-ToCache $path $pageGuid
-}
-# ---------- /helpers v2 ----------
-# === ENSURE events v2 ===
-try { $fsw.EnableRaisingEvents = $false } catch {}
+# ===== EVENT WIRING (clean reset) =====
 try {
-  if(-not $fsw){
-    $fsw = New-Object IO.FileSystemWatcher 'C:\T18'
-    $fsw.IncludeSubdirectories = $true
-    $fsw.Filter='*'
-    $fsw.NotifyFilter = [IO.NotifyFilters]::FileName -bor `
-                        [IO.NotifyFilters]::LastWrite -bor `
-                        [IO.NotifyFilters]::Size
-    $fsw.InternalBufferSize = 65536
-  }
-  'FS-C','FS-U','FS-D','FS-R' | % { Unregister-Event -SourceIdentifier $_ -ErrorAction SilentlyContinue }
+  try { if($fsw){ $fsw.EnableRaisingEvents = $false } } catch {}
+
+  $fsw = New-Object IO.FileSystemWatcher $Root
+  $fsw.IncludeSubdirectories = $true
+  $fsw.Filter = '*'
+  $fsw.NotifyFilter = [IO.NotifyFilters]::FileName -bor [IO.NotifyFilters]::LastWrite -bor [IO.NotifyFilters]::Size
+  $fsw.InternalBufferSize = 65536
+
   function __sz($p){ try { (Get-Item -EA SilentlyContinue $p).Length } catch { 0 } }
 
-  $null = Register-ObjectEvent $fsw Created 'FS-C' -Action {
+  Get-EventSubscriber -EA SilentlyContinue | Where-Object { $_.SourceObject -eq $fsw } | Unregister-Event -Force -EA SilentlyContinue
+
+  $null = Register-ObjectEvent -InputObject $fsw -EventName Created -SourceIdentifier 'FS-C' -Action {
     $p = $Event.SourceEventArgs.FullPath
-    if(-not (Is-Excluded $p)){ Log ("CREATED: {0} size={1}" -f $p, (__sz $p)); Upsert-ActiveWithPreview $p }
+    if(-not (Is-Excluded $p)){ Log ("CREATED: {0} size={1}" -f $p, (__sz $p)); Upsert-Active $p }
   }
-  $null = Register-ObjectEvent $fsw Changed 'FS-U' -Action {
+  $null = Register-ObjectEvent -InputObject $fsw -EventName Changed -SourceIdentifier 'FS-U' -Action {
     $p = $Event.SourceEventArgs.FullPath
-    if(-not (Is-Excluded $p)){ Log ("UPDATED: {0} size={1}" -f $p, (__sz $p)); Upsert-ActiveWithPreview $p }
+    if(-not (Is-Excluded $p)){ Log ("UPDATED: {0} size={1}" -f $p, (__sz $p)); Upsert-Active $p }
   }
-  $null = Register-ObjectEvent $fsw Deleted 'FS-D' -Action {
+  $null = Register-ObjectEvent -InputObject $fsw -EventName Deleted -SourceIdentifier 'FS-D' -Action {
     $p = $Event.SourceEventArgs.FullPath
-    if(-not (Is-Excluded $p)){ Log ("DELETED: {0}" -f $p); Mark-DeletedSafe $p }
+    if(-not (Is-Excluded $p)){ Log ("DELETED: {0}" -f $p); Tombstone $p }
   }
-  $null = Register-ObjectEvent $fsw Renamed 'FS-R' -Action {
-    $old = $Event.SourceEventArgs.OldFullPath; $new = $Event.SourceEventArgs.FullPath
-    if(-not (Is-Excluded $old)){ Log ("RENAMED FROM: {0}" -f $old); Mark-DeletedSafe $old }
-    if(-not (Is-Excluded $new)){ Log ("RENAMED TO:   {0}" -f $new); Upsert-ActiveWithPreview $new }
+  $null = Register-ObjectEvent -InputObject $fsw -EventName Renamed -SourceIdentifier 'FS-R' -Action {
+    $old = $Event.SourceEventArgs.OldFullPath
+    $new = $Event.SourceEventArgs.FullPath
+    if(-not (Is-Excluded $old)){ Log ("RENAMED FROM: {0}" -f $old); Tombstone $old }
+    if(-not (Is-Excluded $new)){ Log ("RENAMED TO:   {0}" -f $new); Upsert-Active $new }
   }
+
   $fsw.EnableRaisingEvents = $true
-  Log ("watching C:\T18 ...")
-} catch { Log ("FATAL: {0}" -f $_) }
-# === /ENSURE events v2 ===
+  Log ("watching {0} ..." -f $Root)
+} catch {
+  Log ("FATAL (wiring): {0}" -f $_)
+  throw
+}
+
+# Keep alive
+while($true){ Start-Sleep 2 }
+# ===== WATCHER (single-runspace, Wait-Event loop) =====
+try { Unregister-Event -SourceIdentifier FS-C -ErrorAction SilentlyContinue } catch {}
+try { Unregister-Event -SourceIdentifier FS-U -ErrorAction SilentlyContinue } catch {}
+try { Unregister-Event -SourceIdentifier FS-D -ErrorAction SilentlyContinue } catch {}
+try { Unregister-Event -SourceIdentifier FS-R -ErrorAction SilentlyContinue } catch {}
+
+try { if($fsw){ $fsw.EnableRaisingEvents = $false } } catch {}
+
+$fsw = New-Object IO.FileSystemWatcher $Root
+$fsw.IncludeSubdirectories = $true
+$fsw.Filter = '*'
+$fsw.NotifyFilter = [IO.NotifyFilters]::FileName -bor [IO.NotifyFilters]::LastWrite -bor [IO.NotifyFilters]::Size
+$fsw.InternalBufferSize = 65536
+
+# Register WITHOUT -Action; we’ll process via Wait-Event so we stay in this runspace
+$null = Register-ObjectEvent -InputObject $fsw -EventName Created -SourceIdentifier 'FS-C'
+$null = Register-ObjectEvent -InputObject $fsw -EventName Changed -SourceIdentifier 'FS-U'
+$null = Register-ObjectEvent -InputObject $fsw -EventName Deleted -SourceIdentifier 'FS-D'
+$null = Register-ObjectEvent -InputObject $fsw -EventName Renamed -SourceIdentifier 'FS-R'
+
+$fsw.EnableRaisingEvents = $true
+Log ("watching {0} ..." -f $Root)
+
+while($true){
+  $e = Wait-Event -Timeout 2
+  if(-not $e){ continue }
+  try{
+    switch($e.SourceIdentifier){
+      'FS-C' {
+        $p = $e.SourceEventArgs.FullPath
+        if(-not (Is-Excluded $p)){
+          $sz = 0; try{ $sz = (Get-Item -EA SilentlyContinue $p).Length } catch {}
+          Log ("CREATED: {0} size={1}" -f $p,$sz)
+          Upsert-Active $p
+        }
+      }
+      'FS-U' {
+        $p = $e.SourceEventArgs.FullPath
+        if(-not (Is-Excluded $p)){
+          $sz = 0; try{ $sz = (Get-Item -EA SilentlyContinue $p).Length } catch {}
+          Log ("UPDATED: {0} size={1}" -f $p,$sz)
+          Upsert-Active $p
+        }
+      }
+      'FS-D' {
+        $p = $e.SourceEventArgs.FullPath
+        if(-not (Is-Excluded $p)){
+          Log ("DELETED: {0}" -f $p)
+          Tombstone $p
+        }
+      }
+      'FS-R' {
+        $old = $e.SourceEventArgs.OldFullPath
+        $new = $e.SourceEventArgs.FullPath
+        if(-not (Is-Excluded $old)){ Log ("RENAMED FROM: {0}" -f $old); Tombstone $old }
+        if(-not (Is-Excluded $new)){
+          $sz = 0; try{ $sz = (Get-Item -EA SilentlyContinue $new).Length } catch {}
+          Log ("RENAMED TO:   {0} size={1}" -f $new,$sz)
+          Upsert-Active $new
+        }
+      }
+    }
+  } catch {
+    Log ("EVENT ERROR: {0}" -f $_)
+  } finally {
+    Remove-Event -EventIdentifier $e.EventIdentifier -ErrorAction SilentlyContinue
+  }
+}
+
+
