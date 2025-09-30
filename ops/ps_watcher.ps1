@@ -179,18 +179,22 @@ $fsw.NotifyFilter = [IO.NotifyFilters]::FileName -bor [IO.NotifyFilters]::LastWr
 $fsw.InternalBufferSize = 65536
 
 Register-ObjectEvent $fsw Created -SourceIdentifier 'FS-C' -Action {
+  if (Test-Path $Event.SourceEventArgs.FullPath -PathType Container) { return }
   try{ $p=$Event.SourceEventArgs.FullPath; if(-not (Is-Excluded $p)){ Upsert-Active $p } }
   catch { Try{ Log ("EVENT ERROR (Created): {0}" -f $_) }Catch{} }
 } | Out-Null
 Register-ObjectEvent $fsw Changed -SourceIdentifier 'FS-U' -Action {
+  if (Test-Path $Event.SourceEventArgs.FullPath -PathType Container) { return }
   try{ $p=$Event.SourceEventArgs.FullPath; if(-not (Is-Excluded $p)){ Upsert-Active $p } }
   catch { Try{ Log ("EVENT ERROR (Changed): {0}" -f $_) }Catch{} }
 } | Out-Null
 Register-ObjectEvent $fsw Deleted -SourceIdentifier 'FS-D' -Action {
+  if (Test-Path $Event.SourceEventArgs.FullPath -PathType Container) { return }
   try{ $p=$Event.SourceEventArgs.FullPath; if(-not (Is-Excluded $p)){ Log ("DELETED: {0}" -f $p); Tombstone $p } }
   catch { Try{ Log ("EVENT ERROR (Deleted): {0}" -f $_) }Catch{} }
 } | Out-Null
 Register-ObjectEvent $fsw Renamed -SourceIdentifier 'FS-R' -Action {
+  if (Test-Path $Event.SourceEventArgs.FullPath -PathType Container) { return }
   try{
     $old=$Event.SourceEventArgs.OldFullPath
     $new=$Event.SourceEventArgs.FullPath
@@ -291,3 +295,4 @@ function Get-RememberedId([string]$path){
 
 try{ Log ("cache hotfix loaded") }catch{}
 # ===== /CACHE HOTFIX ============================================================
+
