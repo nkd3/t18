@@ -79,18 +79,13 @@ def fmt_epoch_series_to_local_str(s: pd.Series, tz: str = "Europe/London") -> pd
     Convert epoch seconds series -> localized string "YYYY-mm-dd HH:MM:SS".
     Handles None/0 safely => empty string. Avoids deprecated fillna downcasting.
     """
-    # Coerce invalid/0 to NaT by mapping 0/None to NaN first
     s_clean = pd.to_numeric(s, errors="coerce")
     s_clean = s_clean.where(s_clean.notna() & (s_clean > 0), other=pd.NA)
-
     dt = pd.to_datetime(s_clean, unit="s", errors="coerce")
-    # Treat as UTC then convert to target TZ
     try:
         dt = dt.dt.tz_localize("UTC").dt.tz_convert(tz)
     except TypeError:
-        # If already tz-aware, just convert
         dt = dt.dt.tz_convert(tz)
-
     out = dt.dt.strftime("%Y-%m-%d %H:%M:%S")
     return out.fillna("")
 
@@ -125,7 +120,6 @@ with db() as con:
     )
 
     if not df.empty:
-        # --- Fix for pandas FutureWarning: avoid .fillna downcasting on object dtype
         df["LastLogin"] = fmt_epoch_series_to_local_str(df["LastLogin"], tz="Europe/London")
         df["Created"]   = fmt_epoch_series_to_local_str(df["Created"], tz="Europe/London")
 
@@ -253,7 +247,6 @@ with db() as con:
                 if st.button("Save changes"):
                     try:
                         if new_role != sel_map["role"]:
-                            # Safety: prevent demotion of last admin
                             ensure_not_last_admin(con, sel_map["user_id"])
                         cur.execute(
                             "UPDATE users SET display_name=?, role=?, active=? WHERE user_id=?",
@@ -372,7 +365,6 @@ with db() as con:
                             meta={},
                         )
                         st.success("TOTP enrolled.")
-                        # Show QR
                         issuer = "T18"
                         otp = pyotp.totp.TOTP(secret)
                         uri = otp.provisioning_uri(name=selected_username, issuer_name=issuer)
@@ -380,7 +372,27 @@ with db() as con:
                         st.image(qr_img, caption="Scan this QR in your Authenticator app")
                         st.code("\n".join(recovery), language="text")
                 else:
-                    st.info("TOTP already enabled. Use recovery codes if device lost.")
+                    st.info("TOTP already enabled.")
+                    col_mfa1, col_mfa2 = st.columns(2)
+                    if col_mfa1.button("Regenerate Recovery Codes"):
+                        import secrets, string
+                        recovery = [
+                            "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(10))
+                            for _ in range(6)
+                        ]
+                        cur.execute(
+                            "UPDATE mfa_secrets SET recovery_json=?, created_ts=? WHERE user_id=?",
+                            (json.dumps(recovery), int(time.time()), sel_map["user_id"])
+                        )
+                        con.commit()
+                        st.success("New recovery codes generated. Copy and store them safely.")
+                        st.code("\n".join(recovery), language="text")
+
+                    if col_mfa2.button("Reset TOTP (Disable)"):
+                        cur.execute("DELETE FROM mfa_secrets WHERE user_id=?", (sel_map["user_id"],))
+                        cur.execute("UPDATE users SET mfa_enabled=0 WHERE user_id=?", (sel_map["user_id"],))
+                        con.commit()
+                        st.warning("TOTP disabled for this user. Re-enroll to enable again.")
 
             # Sessions & Devices
             with st.expander("Sessions & Devices"):

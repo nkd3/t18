@@ -2,11 +2,18 @@
 # C:\T18\scripts\seed_neel_admin.py
 # Creates/updates an active Admin user: username=neel, password=neel
 
+import sys
 from pathlib import Path
+
+# --- PATH BOOTSTRAP (make sure t18_common is importable)
+ROOT = Path(r"C:\T18").resolve()
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import sqlite3
 from t18_common.security import hash_password
 
-DB_PATH = Path(r"C:\T18\data\t18.db")
+DB_PATH = ROOT / "data" / "t18.db"
 
 def main():
     if not DB_PATH.exists():
@@ -15,14 +22,14 @@ def main():
     uname = "neel"
     uname_norm = uname.lower()
     display = "Neel"
-    role = "admin"
+    role = "Admin"  # IMPORTANT: matches CHECK(role IN ('Admin','Trader'))
     pw_hash = hash_password("neel")
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
-        # Ensure username_norm column exists (safety)
+        # Ensure username_norm exists
         cols = [r[1] for r in cur.execute("PRAGMA table_info(users)").fetchall()]
         if "username_norm" not in cols:
             cur.execute("ALTER TABLE users ADD COLUMN username_norm TEXT;")
@@ -38,30 +45,28 @@ def main():
             uid = row["user_id"]
             cur.execute("""
                 UPDATE users
-                   SET username = ?,
+                   SET username      = ?,
                        username_norm = ?,
-                       display_name = ?,
-                       role = ?,
+                       display_name  = ?,
+                       role          = ?,
                        password_hash = ?,
-                       active = 1,
-                       mfa_enabled = COALESCE(mfa_enabled, 0),
-                       force_reset = COALESCE(force_reset, 0)
+                       active        = 1,
+                       mfa_enabled   = COALESCE(mfa_enabled, 0),
+                       force_reset   = COALESCE(force_reset, 0)
                  WHERE user_id = ?
             """, (uname, uname_norm, display, role, pw_hash, uid))
-            print(f"Updated existing user #{uid} -> neel (admin, active).")
+            print(f"Updated existing user #{uid} -> neel (Admin, active).")
         else:
             cur.execute("""
                 INSERT INTO users
                     (username, username_norm, display_name, role,
                      password_hash, active, mfa_enabled, profile_pic,
                      force_reset, last_login_ts, created_ts, deleted_ts)
-                VALUES (?, ?, ?, ?, ?, 1, 0, NULL, 0, NULL, strftime('%s','now'), NULL)
+                VALUES (?, ?, ?, ?, ?, 1, 0, NULL, 0, strftime('%s','now'), strftime('%s','now'), NULL)
             """, (uname, uname_norm, display, role, pw_hash))
-            print("Inserted new user -> neel (admin, active).")
+            print("Inserted new user -> neel (Admin, active).")
 
-        # Helpful index (idempotent)
         cur.execute("CREATE INDEX IF NOT EXISTS ix_users_username_norm ON users(username_norm);")
-
         conn.commit()
 
 if __name__ == "__main__":
