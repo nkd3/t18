@@ -89,5 +89,6 @@
   "C:\\T18\\scripts\\mfa_reset_user.py": "27ee38d1-33c7-81c2-b4c9-fa0411aea2f2",
   "C:\\T18\\scripts\\set_password.py": "27ee38d1-33c7-8159-a95c-c733fea65bba",
   "C:\\T18\\scripts\\set_password_or_create.py": "27ee38d1-33c7-8191-be00-df9659a0454c",
-  "C:\\T18\\scripts\\list_users.py": "27ee38d1-33c7-81b5-aec8-d9c0c5832722"
+  "C:\\T18\\scripts\\list_users.py": "27ee38d1-33c7-81b5-aec8-d9c0c5832722",
+  "C:\\T18\\scripts\\auth_doctor.py": "27fe38d1-33c7-81d1-be57-dddec82537ad"
 }
