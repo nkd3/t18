@@ -11,11 +11,11 @@ import streamlit as st
 from PIL import Image
 import pyotp, qrcode
 
-# ── IMPORTANT: first Streamlit call must be set_page_config ─────────────────────
+# ── IMPORTANT: first Streamlit call must be set_page_config ────────────────────
 APP_TITLE = "Settings • Account & Roles (UAM)"
 st.set_page_config(page_title=APP_TITLE, page_icon="👥", layout="wide")
 
-# ── PATH BOOTSTRAP ─────────────────────────────────────────────────────────────
+# ── PATH BOOTSTRAP ────────────────────────────────────────────────────────────
 ROOT = Path(r"C:\T18").resolve()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -28,7 +28,7 @@ from t18_common.security import (
 )
 from t18_common.audit import log as audit_log
 
-# ── Schema ensure (may show st.error, so it must run AFTER set_page_config) ────
+# ── Schema ensure (may show st.error, so it must run AFTER set_page_config) ───
 def ensure_schema():
     try:
         with _db() as con:
@@ -43,10 +43,10 @@ def ensure_schema():
 
 ensure_schema()
 
-# ── Global Top Bar (renders FIRST, after set_page_config) ──────────────────────
-# parent_href makes the parent title clickable (back to main Settings page).
-# If your routing differs, change to the correct href (e.g., "/?page=05_Settings").
-topbar("Settings", breadcrumb="Account & Roles", parent_href="?page=Settings")
+# ── Global Top Bar (FIRST after set_page_config) ───────────────────────────────
+# No breadcrumb (prevents overlap). Make title clickable back to Settings
+# in the SAME window via target=_self (handled by top bar component).
+topbar("Settings", breadcrumb=None, parent_href="/?page=05_Settings")
 
 st.title("👥 Account & Roles (UAM)")
 
@@ -57,7 +57,7 @@ st.caption(
     f"**DB:** `{db_path_effective}`"
 )
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def db():
     return _db()
 
@@ -127,7 +127,7 @@ def load_users(conn, show_deleted: bool, show_inactive: bool) -> pd.DataFrame:
         df["SoftDeleted"] = df["SoftDeleted"].astype(int)
     return df
 
-# ── Users Directory ────────────────────────────────────────────────────────────
+# ── Users Directory ───────────────────────────────────────────────────────────
 with db() as con:
     st.subheader("Users Directory")
     fc1, fc2, fc3, fc4 = st.columns([1.2, 1.2, 2, 1])
@@ -161,7 +161,7 @@ with db() as con:
     user_list = ["<none>"] + (df["Username"].tolist() if not df.empty else [])
     selected_username = st.selectbox("Select user to manage", user_list)
 
-    # ── Create User ────────────────────────────────────────────────────────────
+    # ── Create User ───────────────────────────────────────────────────────────
     st.divider()
     st.subheader("Create User")
     with st.form("create_user"):
@@ -353,7 +353,7 @@ with db() as con:
                         except Exception as e:
                             st.error(str(e))
 
-            # ── MFA (TOTP) ──────────────────────────────────────────────────────
+            # ── MFA (TOTP) ─────────────────────────────────────────────────────
             with st.expander("MFA (TOTP)"):
                 st.write("Enroll or view status. Recovery codes are shown once on enroll.")
                 if not sel_map["mfa_enabled"]:
@@ -397,12 +397,13 @@ with db() as con:
 
                     if col_mfa2.button("Reset TOTP (Disable)"):
                         cur.execute("DELETE FROM mfa_secrets WHERE user_id=?", (sel_map["user_id"],))
-                        cur.execute("UPDATE users SET mfa_enabled=0 WHERE user_id=?", (sel_map["user_id"]),)
+                        # FIX: ensure parameter tuple (trailing comma)
+                        cur.execute("UPDATE users SET mfa_enabled=0 WHERE user_id=?", (sel_map["user_id"],))
                         con.commit()
                         audit_log(get_actor_username(), "UAM","MFA_RESET", f"username:{selected_username}", meta={})
                         st.warning("TOTP disabled. Re-enroll to enable again.")
 
-# ── Roles & Policy & Audit ─────────────────────────────────────────────────────
+# ── Roles & Policy & Audit ────────────────────────────────────────────────────
 st.divider()
 st.subheader("Roles & Permissions (matrix)")
 with db() as con2:
