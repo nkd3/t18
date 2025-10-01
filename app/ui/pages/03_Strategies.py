@@ -1,6 +1,8 @@
 # Top of file (before 'import t18_common')
 import sys
 from pathlib import Path
+from app.ui.shell.topbar import topbar
+topbar("Strategies")
 
 ROOT = Path(r"C:\T18").resolve()
 if str(ROOT) not in sys.path:

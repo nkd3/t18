@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 # C:\T18\app\ui\pages\01_Dashboard.py
 from __future__ import annotations
+from app.ui.shell.topbar import topbar
+topbar("Dashboard")
 
 # --- PATH BOOTSTRAP (must be before any project imports)
 import sys

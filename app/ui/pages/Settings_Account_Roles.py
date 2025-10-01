@@ -1,28 +1,34 @@
-# -*- coding: utf-8 -*-
 # C:\T18\app\ui\pages\Settings_Account_Roles.py
+# -*- coding: utf-8 -*-
 # Windows • Python 3.11 • Streamlit
 # Relies on: t18_common.security, t18_common.audit, uam_schema
 # DB path: from ENV DB_PATH else C:\T18\data\t18.db
 
-# --- PATH BOOTSTRAP
-import sys
 from pathlib import Path
+import sys, os, io, time, json, base64, sqlite3
+import pandas as pd
+import streamlit as st
+from PIL import Image
+import pyotp, qrcode
+
+# ── IMPORTANT: first Streamlit call must be set_page_config ─────────────────────
+APP_TITLE = "Settings • Account & Roles (UAM)"
+st.set_page_config(page_title=APP_TITLE, page_icon="👥", layout="wide")
+
+# ── PATH BOOTSTRAP ─────────────────────────────────────────────────────────────
 ROOT = Path(r"C:\T18").resolve()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import os, io, time, json, base64, sqlite3, pyotp, qrcode
-import pandas as pd
-import streamlit as st
-from PIL import Image
-
+# Local imports AFTER path bootstrap
+from app.ui.shell.topbar import topbar
 from t18_common.security import (
     _db, hash_password, verify_password, validate_password,
     record_password_history, list_role_caps, ensure_not_last_admin, redact
 )
 from t18_common.audit import log as audit_log
 
-# --- Ensure schema exists (auto-initialize if missing)
+# ── Schema ensure (may show st.error, so it must run AFTER set_page_config) ────
 def ensure_schema():
     try:
         with _db() as con:
@@ -37,8 +43,11 @@ def ensure_schema():
 
 ensure_schema()
 
-APP_TITLE = "Settings • Account & Roles (UAM)"
-st.set_page_config(page_title=APP_TITLE, page_icon="👥", layout="wide")
+# ── Global Top Bar (renders FIRST, after set_page_config) ──────────────────────
+# parent_href makes the parent title clickable (back to main Settings page).
+# If your routing differs, change to the correct href (e.g., "/?page=05_Settings").
+topbar("Settings", breadcrumb="Account & Roles", parent_href="?page=Settings")
+
 st.title("👥 Account & Roles (UAM)")
 
 # Effective DB path (display only)
@@ -48,7 +57,7 @@ st.caption(
     f"**DB:** `{db_path_effective}`"
 )
 
-# --- Helpers
+# ── Helpers ────────────────────────────────────────────────────────────────────
 def db():
     return _db()
 
@@ -118,8 +127,8 @@ def load_users(conn, show_deleted: bool, show_inactive: bool) -> pd.DataFrame:
         df["SoftDeleted"] = df["SoftDeleted"].astype(int)
     return df
 
+# ── Users Directory ────────────────────────────────────────────────────────────
 with db() as con:
-    # ------------------------- Filters & Refresh -------------------------
     st.subheader("Users Directory")
     fc1, fc2, fc3, fc4 = st.columns([1.2, 1.2, 2, 1])
     with fc1:
@@ -152,7 +161,7 @@ with db() as con:
     user_list = ["<none>"] + (df["Username"].tolist() if not df.empty else [])
     selected_username = st.selectbox("Select user to manage", user_list)
 
-    # ---- Create User (robust) ----
+    # ── Create User ────────────────────────────────────────────────────────────
     st.divider()
     st.subheader("Create User")
     with st.form("create_user"):
@@ -289,7 +298,7 @@ with db() as con:
                             audit_log(get_actor_username(), "UAM","RESET_PASSWORD", f"username:{selected_username}", meta={})
                             st.success("Password reset and set to force change on next login.")
 
-                    # Quick Set Temp Password & Activate (GUI-based, no scripts)
+                    # Quick Set Temp Password & Activate
                     st.markdown("---")
                     st.markdown("**Quick Set Temp Password & Activate**")
                     temp_pwd = st.text_input("Temp password", value="P@ssw0rd@100", type="password", key="temp_pwd_setter")
@@ -344,7 +353,7 @@ with db() as con:
                         except Exception as e:
                             st.error(str(e))
 
-            # ---------------- MFA (TOTP) ----------------
+            # ── MFA (TOTP) ──────────────────────────────────────────────────────
             with st.expander("MFA (TOTP)"):
                 st.write("Enroll or view status. Recovery codes are shown once on enroll.")
                 if not sel_map["mfa_enabled"]:
@@ -388,71 +397,71 @@ with db() as con:
 
                     if col_mfa2.button("Reset TOTP (Disable)"):
                         cur.execute("DELETE FROM mfa_secrets WHERE user_id=?", (sel_map["user_id"],))
-                        cur.execute("UPDATE users SET mfa_enabled=0 WHERE user_id=?", (sel_map["user_id"],))
+                        cur.execute("UPDATE users SET mfa_enabled=0 WHERE user_id=?", (sel_map["user_id"]),)
                         con.commit()
                         audit_log(get_actor_username(), "UAM","MFA_RESET", f"username:{selected_username}", meta={})
                         st.warning("TOTP disabled. Re-enroll to enable again.")
 
-    # ---------------- Roles & Policy & Audit ----------------
-    st.divider()
-    st.subheader("Roles & Permissions (matrix)")
-    with db() as con2:
-        rp = pd.read_sql_query("SELECT role, capability FROM role_permissions ORDER BY role, capability", con2)
-    st.dataframe(rp, use_container_width=True, hide_index=True)
+# ── Roles & Policy & Audit ─────────────────────────────────────────────────────
+st.divider()
+st.subheader("Roles & Permissions (matrix)")
+with db() as con2:
+    rp = pd.read_sql_query("SELECT role, capability FROM role_permissions ORDER BY role, capability", con2)
+st.dataframe(rp, use_container_width=True, hide_index=True)
 
-    st.divider()
-    st.subheader("Password Policy")
-    with db() as con3:
-        show_policy_preview(con3)
-        with st.form("pol_form"):
-            pol_df = pd.read_sql_query("SELECT * FROM password_policy WHERE id=1", con3)
-            if pol_df.empty:
-                st.error("Password policy row is missing (id=1). Please run schema bootstrap.")
-            else:
-                pol = pol_df.iloc[0].to_dict()
-                c1, c2, c3, c4, c5 = st.columns(5)
-                min_length = c1.number_input("Min length", min_value=6, max_value=128, value=int(pol["min_length"]))
-                histN      = c2.number_input("History N", min_value=0, max_value=24, value=int(pol["history_N"]))
-                expiry     = c3.number_input("Expiry (days)", min_value=0, max_value=365, value=int(pol["expiry_days"]))
-                lock_thr   = c4.number_input("Lockout threshold", min_value=0, max_value=20, value=int(pol["lockout_thresh"]))
-                lock_sec   = c5.number_input("Cooldown (secs)", min_value=0, max_value=86400, value=int(pol["lockout_secs"]))
+st.divider()
+st.subheader("Password Policy")
+with db() as con3:
+    show_policy_preview(con3)
+    with st.form("pol_form"):
+        pol_df = pd.read_sql_query("SELECT * FROM password_policy WHERE id=1", con3)
+        if pol_df.empty:
+            st.error("Password policy row is missing (id=1). Please run schema bootstrap.")
+        else:
+            pol = pol_df.iloc[0].to_dict()
+            c1, c2, c3, c4, c5 = st.columns(5)
+            min_length = c1.number_input("Min length", min_value=6, max_value=128, value=int(pol["min_length"]))
+            histN      = c2.number_input("History N", min_value=0, max_value=24, value=int(pol["history_N"]))
+            expiry     = c3.number_input("Expiry (days)", min_value=0, max_value=365, value=int(pol["expiry_days"]))
+            lock_thr   = c4.number_input("Lockout threshold", min_value=0, max_value=20, value=int(pol["lockout_thresh"]))
+            lock_sec   = c5.number_input("Cooldown (secs)", min_value=0, max_value=86400, value=int(pol["lockout_secs"]))
 
-                r1, r2, r3, r4, r5 = st.columns(5)
-                reqU = r1.checkbox("Require UPPER", value=bool(pol["require_upper"]))
-                reqL = r2.checkbox("Require lower", value=bool(pol["require_lower"]))
-                reqD = r3.checkbox("Require digit", value=bool(pol["require_digit"]))
-                reqS = r4.checkbox("Require symbol", value=bool(pol["require_symbol"]))
-                blk  = r5.checkbox("Blocklist on", value=bool(pol["blocklist_on"]))
+            r1, r2, r3, r4, r5 = st.columns(5)
+            reqU = r1.checkbox("Require UPPER", value=bool(pol["require_upper"]))
+            reqL = r2.checkbox("Require lower", value=bool(pol["require_lower"]))
+            reqD = r3.checkbox("Require digit", value=bool(pol["require_digit"]))
+            reqS = r4.checkbox("Require symbol", value=bool(pol["require_symbol"]))
+            blk  = r5.checkbox("Blocklist on", value=bool(pol["blocklist_on"]))
 
-                if st.form_submit_button("Save policy"):
-                    cur = con3.cursor()
-                    cur.execute(
-                        """UPDATE password_policy SET
-                             min_length=?, history_N=?, expiry_days=?, lockout_thresh=?, lockout_secs=?,
-                             require_upper=?, require_lower=?, require_digit=?, require_symbol=?, blocklist_on=?
-                           WHERE id=1""",
-                        (min_length, histN, expiry, lock_thr, lock_sec,
-                         int(reqU), int(reqL), int(reqD), int(reqS), int(blk))
-                    )
-                    con3.commit()
-                    audit_log(get_actor_username(), "UAM","POLICY_EDIT", "password_policy", meta={})
-                    st.success("Policy saved.")
+            if st.form_submit_button("Save policy"):
+                cur = con3.cursor()
+                cur.execute(
+                    """UPDATE password_policy SET
+                         min_length=?, history_N=?, expiry_days=?, lockout_thresh=?, lockout_secs=?,
+                         require_upper=?, require_lower=?, require_digit=?, require_symbol=?, blocklist_on=?
+                       WHERE id=1""",
+                    (min_length, histN, expiry, lock_thr, lock_sec,
+                     int(reqU), int(reqL), int(reqD), int(reqS), int(blk))
+                )
+                con3.commit()
+                audit_log(get_actor_username(), "UAM","POLICY_EDIT", "password_policy", meta={})
+                st.success("Policy saved.")
 
-    st.divider()
-    st.subheader("Audit & Compliance")
-    with db() as con4:
-        actor = st.text_input("Actor username filter (optional)")
-        time_min = st.number_input("From (epoch sec, optional)", value=0)
-        q = "SELECT ts, actor_username, scope, action, target, meta_json FROM audit_log WHERE 1=1"
-        params = []
-        if actor:
-            q += " AND actor_username=?"; params.append(actor)
-        if time_min>0:
-            q += " AND ts>=?"; params.append(int(time_min))
-        q += " ORDER BY ts DESC LIMIT 1000"
-        aud = pd.read_sql_query(q, con4, params=params)
-        if not aud.empty:
-            aud["ts"] = fmt_epoch_series_to_local_str(aud["ts"], tz="Europe/London")
-        st.dataframe(aud, use_container_width=True, hide_index=True)
+st.divider()
+st.subheader("Audit & Compliance")
+with db() as con4:
+    actor = st.text_input("Actor username filter (optional)")
+    time_min = st.number_input("From (epoch sec, optional)", value=0)
+    q = "SELECT ts, actor_username, scope, action, target, meta_json FROM audit_log WHERE 1=1"
+    params = []
+    if actor:
+        q += " AND actor_username=?"; params.append(actor)
+    if time_min>0:
+        q += " AND ts>=?"; params.append(int(time_min))
+    q += " ORDER BY ts DESC LIMIT 1000"
+    aud = pd.read_sql_query(q, con4, params=params)
+    if not aud.empty:
+        aud["ts"] = fmt_epoch_series_to_local_str(aud["ts"], tz="Europe/London")
+    st.dataframe(aud, use_container_width=True, hide_index=True)
 
 st.info("Safety: UI prevents removing/demoting the last Admin. Keep at least two Admins for recovery.")

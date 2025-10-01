@@ -1,29 +1,20 @@
+# C:\T18\app\ui\pages\05_Settings.py
 # -*- coding: utf-8 -*-
 from pathlib import Path
 import sys
 import streamlit as st
+
+# ---- MUST be first Streamlit call ----
+st.set_page_config(page_title="Settings • Teevra18", page_icon="⚙️", layout="wide")
 
 # Bootstrap root for imports
 ROOT = Path(r"C:\T18").resolve()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# ---- Consistent Top Bar (minimal example) ----
-st.set_page_config(page_title="Settings • Teevra18", page_icon="⚙️", layout="wide")
+from app.ui.shell.topbar import topbar
+topbar("Settings")
 
-def render_topbar():
-    cols = st.columns([4,2,2,2])
-    with cols[0]:
-        st.markdown("### ⚙️ Settings")
-        st.caption("Configure everything from GUI • #t18set")
-    with cols[1]:
-        st.metric("Mode", st.session_state.get("mode", "Paper"))
-    with cols[2]:
-        st.metric("Breaker", st.session_state.get("breaker", "RUNNING"))
-    with cols[3]:
-        st.markdown("[#t18repo](https://github.com/nkd3/t18) · #t18sync")
-
-render_topbar()
 st.divider()
 
 # ---- Cards Grid ----
@@ -31,7 +22,7 @@ st.divider()
 def nav_button(label: str, target_page_path: str, key: str):
     # target_page_path is relative to app/ui/pages/ e.g. "Settings_Account_Roles.py"
     if st.button(label, key=key, use_container_width=True):
-        # Streamlit 1.25+ supports switch_page with absolute-like path
+        # Streamlit 1.25+ supports switch_page with relative path inside /pages
         st.switch_page(f"pages/{target_page_path}")
 
 # Layout the cards

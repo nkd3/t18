@@ -1,15 +1,16 @@
+# C:\T18\app\ui\webparts\topbar_webpart.py
 import streamlit as st
 from pathlib import Path
 
 ASSETS = Path(r"C:\T18\assets")
 
 def render_topbar():
-    c1,c2,c3,c4 = st.columns([1.2,4,2,1])
+    c1, c2, c3, c4 = st.columns([1.2, 4, 2, 1])
     with c1:
-        logo = ASSETS/"Teevra18_Logo.png"
+        logo = ASSETS / "Teevra18_Logo.png"
         if logo.exists():
-            # New API: width="content" instead of use_container_width=False
-            st.image(str(logo), width="content")
+            # FIX: width must be int or None, not a string
+            st.image(str(logo), width=None)
         else:
             st.markdown("### 🐯 TeeVra18")
     with c2:
