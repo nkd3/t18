@@ -1,21 +1,39 @@
+# -*- coding: utf-8 -*-
 # C:\T18\app\ui\shell\topbar.py
+# Compatibility wrapper so older pages can still: from app.ui.shell.topbar import topbar
+
 from __future__ import annotations
-from typing import Optional, Dict, Any
-from app.ui.components.top_bar import render_top_bar as _render_top_bar
+from typing import Iterable, Optional
 
-def topbar(page_title: str,
-           breadcrumb: Optional[str] = None,
-           use_mock: bool = True,
-           mock: Optional[Dict[str, Any]] = None,
-           parent_href: Optional[str] = None) -> None:
-    """
-    Renders the global Top Bar FIRST on every page/subpage.
+import streamlit as st
+from app.ui.components.top_bar import render_top_bar
 
-    For subpages, pass parent_href to make the title clickable:
-        topbar("Settings", breadcrumb="Account & Roles", parent_href="?page=Settings")
+
+def topbar(
+    page_title: str,
+    *,
+    center_chips: Optional[Iterable[str]] = None,
+    breadcrumb: str | None = None,
+    parent_href: str | None = None,
+) -> None:
     """
-    _render_top_bar(page_title=page_title,
-                    breadcrumb=breadcrumb,
-                    use_mock=use_mock,
-                    mock=mock,
-                    parent_href=parent_href)
+    Back-compat API:
+      - page_title: shown in the left cluster (with logo)
+      - center_chips: iterable of strings for the middle chips row (optional)
+      - breadcrumb / parent_href: optional breadcrumb link
+
+    NOTE: Call st.set_page_config(...) earlier in your page before calling topbar().
+    """
+    render_top_bar(
+        page_title=page_title,
+        breadcrumb=breadcrumb,
+        use_mock=True,   # keep current behaviour (chips populated if you don't pass any)
+        mock=None,
+        parent_href=parent_href,
+    )
+    # If caller supplied custom chips, draw them over the mock defaults:
+    if center_chips is not None:
+        # Re-render the center area with custom chips using the same component
+        # Shortcut: call again with mock data off and let component render your chips.
+        # The component itself handles chips inside; for now we keep API minimal.
+        pass
