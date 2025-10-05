@@ -1,0 +1,18 @@
+﻿# OS/IDE
+.vscode/
+*.code-workspace
+
+# Python/env/build (future-safe)
+.venv/
+__pycache__/
+build/
+dist/
+*.spec
+
+# Data & logs (kept locally; export when needed)
+data/
+logs/
+
+# Secrets (we will store encrypted; never commit)
+*.env
+secrets/
