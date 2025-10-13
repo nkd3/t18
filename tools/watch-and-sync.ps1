@@ -1,10 +1,11 @@
 <# 
 T18 Auto Watch & Sync (Windows)
 - Watches C:\T18 (recursively) for changes.
-- Debounces bursts, then: git add -> pull --rebase -> commit -> push.
+- Debounces bursts, then: git add -> commit -> pull --rebase -> push.
 - Skips if nothing to commit.
 - Logs to C:\T18\logs\sync.log
 - Respects .gitignore (we rely on `git status --porcelain` to detect staged changes).
+- Single-instance safe.
 #>
 
 $ErrorActionPreference = "Stop"
@@ -12,7 +13,7 @@ $ErrorActionPreference = "Stop"
 # --- settings ---
 $RepoPath   = "C:\T18"
 $Branch     = "main"
-$DebounceMs = 7000      # wait this long after last change before a sync
+$DebounceMs = 7000
 $LogDir     = Join-Path $RepoPath "logs"
 $LogFile    = Join-Path $LogDir "sync.log"
 
@@ -23,10 +24,17 @@ function Log([string]$msg) {
   "$stamp  $msg" | Out-File -FilePath $LogFile -Append -Encoding utf8
 }
 
-# --- ensure repo exists ---
-if (-not (Test-Path $RepoPath)) {
-  throw "Repo path not found: $RepoPath"
+# --- single instance guard (FIXED) ---
+$mutexName = "Global\T18WatchSync"
+$created = $false     # 👈 declare before using [ref]
+$mutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$created)
+if (-not $mutex.WaitOne(0, $false)) {
+  Log "Another watcher instance already running. Exiting."
+  exit 0
 }
+
+# --- ensure repo exists ---
+if (-not (Test-Path $RepoPath)) { throw "Repo path not found: $RepoPath" }
 Set-Location $RepoPath
 
 # --- ensure branch ---
@@ -44,16 +52,17 @@ try {
 $timer = New-Object Timers.Timer
 $timer.Interval = $DebounceMs
 $timer.AutoReset = $false
-$timerEnabled = $false
-
 $syncLock = New-Object object
+$isSyncing = $false
 
-# --- the core sync ---
+# --- core sync ---
 function Do-Sync {
+  if ($isSyncing) { return }
+  $isSyncing = $true
   try {
     Set-Location $RepoPath
+    try { git rebase --abort | Out-Null } catch {}
 
-    # Only proceed if there are changes (respects .gitignore)
     $status = git status --porcelain
     if ([string]::IsNullOrWhiteSpace($status)) {
       Log "No changes to commit."
@@ -64,12 +73,10 @@ function Do-Sync {
     $msg = "auto-sync: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     git commit -m $msg | Out-Null
 
-    # Rebase our new commit(s) on top of origin
     try {
       git pull --rebase origin $Branch | Out-Null
     } catch {
       Log "PULL/REBASE-ERROR: $($_.Exception.Message)"
-      # Undo just the last commit, keep changes staged for manual resolve
       try { git rebase --abort | Out-Null } catch {}
       try { git reset --soft HEAD~1 | Out-Null } catch {}
       Log "Rebase conflict. Last commit undone (changes kept). Manual resolution required."
@@ -85,6 +92,8 @@ function Do-Sync {
 
   } catch {
     Log "SYNC-ERROR: $($_.Exception.Message)"
+  } finally {
+    $isSyncing = $false
   }
 }
 
@@ -94,49 +103,33 @@ $fsw.Path = $RepoPath
 $fsw.IncludeSubdirectories = $true
 $fsw.NotifyFilter = [IO.NotifyFilters]'FileName, DirectoryName, LastWrite, Size, Attributes'
 
-# Ignore changes within .git folder
 function Should-Ignore($path) {
   if ([string]::IsNullOrEmpty($path)) { return $false }
-  # Normalize
   $p = $path.ToLower()
   return $p.Contains("\.git\")
 }
 
-$handler = Register-ObjectEvent -InputObject $fsw -EventName Changed -Action {
-  if (Should-Ignore($Event.SourceEventArgs.FullPath)) { return }
-  [System.Threading.Monitor]::Enter($syncLock)
-  try {
-    # Restart debounce timer
-    $timer.Stop()
-    $timer.Start()
-  } finally {
-    [System.Threading.Monitor]::Exit($syncLock)
-  }
-}
-
-# React also to Created/Deleted/Renamed
-$handler2 = Register-ObjectEvent -InputObject $fsw -EventName Created -Action {
-  if (Should-Ignore($Event.SourceEventArgs.FullPath)) { return }
-  [System.Threading.Monitor]::Enter($syncLock)
-  try { $timer.Stop(); $timer.Start() } finally { [System.Threading.Monitor]::Exit($syncLock) }
-}
-$handler3 = Register-ObjectEvent -InputObject $fsw -EventName Deleted -Action {
-  if (Should-Ignore($Event.SourceEventArgs.FullPath)) { return }
-  [System.Threading.Monitor]::Enter($syncLock)
-  try { $timer.Stop(); $timer.Start() } finally { [System.Threading.Monitor]::Exit($syncLock) }
-}
-$handler4 = Register-ObjectEvent -InputObject $fsw -EventName Renamed -Action {
-  if (Should-Ignore($Event.SourceEventArgs.FullPath)) { return }
+function Restart-Timer {
   [System.Threading.Monitor]::Enter($syncLock)
   try { $timer.Stop(); $timer.Start() } finally { [System.Threading.Monitor]::Exit($syncLock) }
 }
 
-# Timer fires -> run sync
-$timerEvent = Register-ObjectEvent -InputObject $timer -EventName Elapsed -Action { Do-Sync }
+Register-ObjectEvent -InputObject $fsw -EventName Changed -Action {
+  if (-not (Should-Ignore $Event.SourceEventArgs.FullPath)) { Restart-Timer }
+} | Out-Null
+Register-ObjectEvent -InputObject $fsw -EventName Created -Action {
+  if (-not (Should-Ignore $Event.SourceEventArgs.FullPath)) { Restart-Timer }
+} | Out-Null
+Register-ObjectEvent -InputObject $fsw -EventName Deleted -Action {
+  if (-not (Should-Ignore $Event.SourceEventArgs.FullPath)) { Restart-Timer }
+} | Out-Null
+Register-ObjectEvent -InputObject $fsw -EventName Renamed -Action {
+  if (-not (Should-Ignore $Event.SourceEventArgs.FullPath)) { Restart-Timer }
+} | Out-Null
 
-# Start watching
+Register-ObjectEvent -InputObject $timer -EventName Elapsed -Action { Do-Sync } | Out-Null
+
 $fsw.EnableRaisingEvents = $true
 Log "Watcher started on $RepoPath, branch=$Branch, debounce=${DebounceMs}ms"
 
-# Keep the script alive (service/task host)
 while ($true) { Start-Sleep -Seconds 5 }
