@@ -53,7 +53,7 @@ function Do-Sync {
   try {
     Set-Location $RepoPath
 
-    # Only proceed if there are changes tracked by git (respects .gitignore)
+    # Only proceed if there are changes (respects .gitignore)
     $status = git status --porcelain
     if ([string]::IsNullOrWhiteSpace($status)) {
       Log "No changes to commit."
@@ -61,20 +61,20 @@ function Do-Sync {
     }
 
     git add -A | Out-Null
+    $msg = "auto-sync: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    git commit -m $msg | Out-Null
 
-    # Rebase-pull to avoid merge commits
+    # Rebase our new commit(s) on top of origin
     try {
       git pull --rebase origin $Branch | Out-Null
     } catch {
-      Log "PULL-ERROR: $($_.Exception.Message)"
-      # If rebase conflicts occur, abort rebase and log; leave for manual resolve
+      Log "PULL/REBASE-ERROR: $($_.Exception.Message)"
+      # Undo just the last commit, keep changes staged for manual resolve
       try { git rebase --abort | Out-Null } catch {}
-      Log "Rebase conflicts detected. Manual intervention required."
+      try { git reset --soft HEAD~1 | Out-Null } catch {}
+      Log "Rebase conflict. Last commit undone (changes kept). Manual resolution required."
       return
     }
-
-    $msg = "auto-sync: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-    git commit -m $msg | Out-Null
 
     try {
       git push origin $Branch | Out-Null
