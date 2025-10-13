@@ -1,18 +1,30 @@
-﻿# OS/IDE
-.vscode/
-*.code-workspace
+﻿# secrets & env
+.env
+.env.* 
+*.pem
+*.key
+*.pfx
 
-# Python/env/build (future-safe)
-.venv/
+# local data & logs
+/data/
+/logs/
+/installers/
+/backup_*/
+
+# DB & analytics artifacts
+*.sqlite
+*.db
+*.parquet
+*.feather
+
+# Python & build
 __pycache__/
-build/
+*.pyc
 dist/
-*.spec
+build/
 
-# Data & logs (kept locally; export when needed)
-data/
-logs/
-
-# Secrets (we will store encrypted; never commit)
-*.env
-secrets/
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
