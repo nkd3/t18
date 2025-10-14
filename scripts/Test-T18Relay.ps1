@@ -1,17 +1,12 @@
-# C:\T18\scripts\Test-T18Relay.ps1
+﻿# C:\T18\scripts\Test-T18Relay.ps1
 # T18 Relay self-test (Windows) — verifies SSH tunnel + health + legacy + dhBody live-pass
 
 $ErrorActionPreference = "Stop"
 
-# --- EDIT THESE TWO VALUES ---
-$VpsUser = "t18svc"                # your VPS user
-$VpsHost = "YOUR.VPS.IP.ADDR"      # <-- replace with your real Vultr IPv4
-# --------------------------------
-
-if ($VpsHost -match '^YOUR\.VPS\.IP\.ADDR$') {
-  Write-Host "ERROR: You must set `$VpsHost to your real VPS IPv4." -ForegroundColor Red
-  exit 1
-}
+# --- REAL VPS DETAILS (pre-filled) ---
+$VpsUser = "t18svc"
+$VpsHost = "65.20.67.164"
+# -------------------------------------
 
 # Ensure ssh.exe exists
 $ssh = (Get-Command ssh -ErrorAction SilentlyContinue)
@@ -25,18 +20,13 @@ $LogDir    = "C:\T18\data\logs"
 $LogFile   = Join-Path $LogDir "relay_selftest.log"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
-function Write-Log {
-  param([string]$msg)
+function Write-Log { param([string]$msg)
   $ts = (Get-Date).ToString("s")
   "$ts  $msg" | Tee-Object -FilePath $LogFile -Append
 }
 
 function Wait-Port {
-  param(
-    [string]$HostName,
-    [int]$Port,
-    [int]$TimeoutSec = 15
-  )
+  param([string]$HostName,[int]$Port,[int]$TimeoutSec=15)
   $deadline = (Get-Date).AddSeconds($TimeoutSec)
   do {
     try {
@@ -69,11 +59,7 @@ if (-not (Wait-Port -HostName "127.0.0.1" -Port $LocalPort -TimeoutSec 15)) {
 
 # 3) Helper to run curl with status capture (body + HTTP code)
 function Invoke-Curl {
-  param(
-    [string]$Url,
-    [ValidateSet('GET','POST')] [string]$Method = "GET",
-    [string]$JsonBody = $null
-  )
+  param([string]$Url,[ValidateSet('GET','POST')][string]$Method="GET",[string]$JsonBody=$null)
   $tmp = New-TemporaryFile
   try {
     if ($Method -eq "GET") {
@@ -87,9 +73,7 @@ function Invoke-Curl {
     $body  = $parts[0].Trim()
     $code  = [int]$parts[1].Trim()
     return [pscustomobject]@{ Status = $code; Body = $body }
-  } finally {
-    Remove-Item $tmp -ErrorAction SilentlyContinue
-  }
+  } finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
 }
 
 # 4) Health (GET)
