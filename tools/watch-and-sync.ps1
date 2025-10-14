@@ -1,147 +1,273 @@
-<#
-T18 Auto Watch & Sync – v10.3 (PS5 stable)
-- Poll every 5s; commit local changes, fetch, ff-only or push.
-- No auto-rebase; if diverged, log and short backoff.
-- Uses Start-Process to run git => no NativeCommandError.
-- Logs outside repo: %LOCALAPPDATA%\T18\logs\sync.log
-- Single instance via mutex.
-#>
+<# =====================================================================
+ T18 Auto Watch & Sync (Windows) — v11
+ - Polls C:\T18 for changes and syncs to GitHub.
+ - Debounce/batch commits, safe auto-rebase-pull, push.
+ - Adds extra ignore patterns to .git/info/exclude.
+ - Rotates log weekly (or if too big).
+ Tested on Windows PowerShell 5.1 (no PS7-only operators used).
+===================================================================== #>
 
 $ErrorActionPreference = "Stop"
 
-# --- settings ---
-$RepoPath    = "C:\T18"
-$Branch      = "main"
-$PollMs      = 5000
-$BackoffSec  = 120
+# --- SETTINGS ---------------------------------------------------------
+$RepoPath            = "C:\T18"
+$Branch              = "main"
 
-# --- git path (absolute) ---
-$Git = (Get-Command git.exe -ErrorAction Stop).Source  # e.g. C:\Program Files\Git\cmd\git.exe
+# Poll interval (ms) for checking git state and file changes
+$PollMs              = 5000
 
-# --- logs outside repo ---
-$LogDir      = Join-Path $env:LOCALAPPDATA "T18\logs"
-$LogFile     = Join-Path $LogDir "sync.log"
-$BackoffFile = Join-Path $LogDir "rebase_backoff.txt"
-New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+# Batch commit "quiet window" in seconds (wait for edits to settle)
+$BatchQuietSeconds   = 15
+
+# Extra ignore patterns beyond .gitignore (written to .git/info/exclude)
+$ExtraIgnores        = @(
+  "*.log",
+  "*.tmp",
+  "~$*",
+  "*.swp",
+  "*.swx"
+)
+
+# Log location (per-user so it survives permissions, etc.)
+$LogRoot             = Join-Path $env:LOCALAPPDATA "T18\logs"
+$LogFile             = Join-Path $LogRoot "sync.log"
+
+# Log rotation policy
+$RotateIfOlderDays   = 7          # rotate if last write > N days
+$RotateIfLargerMB    = 5          # …or size > N MB
+
+# Path to git (auto-detect)
+$Git                 = "$env:ProgramFiles\Git\cmd\git.exe"
+if (-not (Test-Path $Git)) { $Git = "git" }
+
+# Named instance guard (so only 1 watcher runs)
+$MutexName           = "Global\T18WatchSync_v11"
+
+# --- INFRA ------------------------------------------------------------
+New-Item -ItemType Directory -Force -Path $LogRoot | Out-Null
 function Log([string]$msg) {
   $stamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
   "$stamp  $msg" | Out-File -FilePath $LogFile -Append -Encoding utf8
 }
+function LogGit([string]$line) { Log ("git> " + $line) }
 
-# --- single instance ---
-$mutexName = "Global\T18WatchSyncV103"
-$created = $false
-$mutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$created)
-if (-not $mutex.WaitOne(0, $false)) { Log "Another v10.3 instance is running. Exiting."; exit 0 }
-
-# --- safe git runner (no PS NativeCommandError) ---
-function Join-Args {
-  param([string[]]$items)
-  $items | ForEach-Object {
-    if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
-  } | Out-String
-}
-function Run-Git {
-  param([Parameter(Mandatory=$true)][string[]]$argv)
-  $psi = New-Object System.Diagnostics.ProcessStartInfo
-  $psi.FileName = $Git
-  # Build a safe single-string Args (git.exe parses spaces)
-  $psi.Arguments = ([string]::Join(' ', ($argv | ForEach-Object {
-    if ($_ -match '[\s"]') { '"' + ($_ -replace '"','\"') + '"' } else { $_ }
-  })))
-  $psi.UseShellExecute = $false
-  $psi.RedirectStandardOutput = $true
-  $psi.RedirectStandardError  = $true
-  $psi.CreateNoWindow = $true
-  $p = [System.Diagnostics.Process]::Start($psi)
-  $stdout = $p.StandardOutput.ReadToEnd()
-  $stderr = $p.StandardError.ReadToEnd()
-  $p.WaitForExit()
-  if ($stdout) { ($stdout -split "`r?`n") | Where-Object { $_ -ne '' } | ForEach-Object { Log "git> $_" } }
-  if ($stderr) { ($stderr -split "`r?`n") | Where-Object { $_ -ne '' } | ForEach-Object { Log "git> $_" } }
-  return $p.ExitCode
-}
-
-function In-Backoff {
-  if (-not (Test-Path $BackoffFile)) { return $false }
-  $txt = Get-Content $BackoffFile -ErrorAction SilentlyContinue
-  if (-not $txt) { return $false }
-  $t = [datetime]::Parse($txt)
-  return ((Get-Date) -lt $t)
-}
-function Start-Backoff {
-  $until = (Get-Date).AddSeconds($BackoffSec)
-  $until.ToString("o") | Out-File -FilePath $BackoffFile -Encoding utf8 -Force
-  Log "Entering backoff until $($until.ToString('HH:mm:ss'))."
-}
-function Clear-Backoff { if (Test-Path $BackoffFile) { Remove-Item $BackoffFile -Force -ErrorAction SilentlyContinue } }
-function Get-Divergence {
-  [void](Run-Git -argv @('fetch','origin',$Branch))
-  $out = & $Git rev-list --left-right --count "origin/$Branch...HEAD" 2>$null
-  if (-not $out) { return @{ RemoteAhead = 0; LocalAhead = 0 } }
-  $p = $out -split "\s+"
-  return @{ RemoteAhead = [int]$p[0]; LocalAhead = [int]$p[1] }
-}
-
-# --- repo/branch, one-time configs ---
-if (-not (Test-Path $RepoPath)) { throw "Repo path not found: $RepoPath" }
-Set-Location $RepoPath
-try {
-  $cur = (& $Git rev-parse --abbrev-ref HEAD).Trim()
-  if ($cur -ne $Branch) { Log "Switching to $Branch (was $cur)"; [void](Run-Git -argv @('checkout','-B',$Branch)) }
-} catch { Log "WARN: Cannot read current branch: $($_.Exception.Message)" }
-
-# silence CRLF noise for this repo
-[void](Run-Git -argv @('config','core.autocrlf','true'))
-[void](Run-Git -argv @('config','core.safecrlf','false'))
-
-Log "Watcher v10.3 (polling) started | repo=$RepoPath | branch=$Branch | poll=${PollMs}ms | git=$Git"
-[void](Run-Git -argv @('--version'))
-
-# --- main loop ---
-while ($true) {
-  # 1) Commit local changes (respects .gitignore)
-  $status = & $Git status --porcelain
-  $madeCommit = $false
-  $msg = $null
-  if (-not [string]::IsNullOrWhiteSpace($status)) {
-    if ((Run-Git -argv @('add','-A')) -eq 0) {
-      $msg = "auto-sync: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-      if ((Run-Git -argv @('commit','-m',$msg)) -eq 0) {
-        $madeCommit = $true
-        Log "Committed: $msg"
-      } else { Log "WARN: commit exit $LASTEXITCODE" }
-    } else { Log "WARN: add exit $LASTEXITCODE" }
+function Rotate-LogIfNeeded {
+  try {
+    if (-not (Test-Path $LogFile)) { return }
+    $fi = Get-Item $LogFile
+    $ageDays = (New-TimeSpan -Start $fi.LastWriteTime -End (Get-Date)).TotalDays
+    $sizeMB  = [math]::Round(($fi.Length / 1MB),2)
+    if ($ageDays -gt $RotateIfOlderDays -or $sizeMB -gt $RotateIfLargerMB) {
+      $stamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
+      $arch  = Join-Path $LogRoot ("sync-" + $stamp + ".log")
+      Copy-Item $LogFile $arch -Force
+      "" | Out-File -FilePath $LogFile -Encoding utf8
+      Log "Log rotated -> $([System.IO.Path]::GetFileName($arch)) (age=${ageDays}d, size=${sizeMB}MB)"
+    }
+  } catch {
+    # Best-effort; never crash the watcher on rotate
   }
+}
 
-  # 2) Divergence
-  $div = Get-Divergence
-  $ra = $div.RemoteAhead
-  $la = $div.LocalAhead
-  Log "Divergence: remoteAhead=$ra, localAhead=$la"
+function Ensure-RepoReady {
+  if (-not (Test-Path $RepoPath)) { throw "Repo path not found: $RepoPath" }
+  Set-Location $RepoPath
+  try {
+    $cur = (& $Git rev-parse --abbrev-ref HEAD 2>$null).Trim()
+    if ($cur -ne $Branch) {
+      Log "Switching to $Branch (was $cur)"
+      & $Git checkout -B $Branch | ForEach-Object { LogGit $_ }
+    }
+  } catch {
+    Log "WARN: Could not determine branch: $($_.Exception.Message)"
+  }
+}
 
-  if ($ra -eq 0 -and $la -gt 0) {
-    if ((Run-Git -argv @('push','origin',$Branch)) -eq 0) {
-      if ($msg) { Log ("Pushed OK: " + $msg) } else { Log "Pushed OK: existing local commits" }
-      Clear-Backoff
-    } else { Log "WARN: push exit $LASTEXITCODE" }
-  } elseif ($ra -gt 0 -and $la -eq 0) {
-    if ((Run-Git -argv @('merge','--ff-only',"origin/$Branch")) -eq 0) {
-      Log "Fast-forwarded to origin/$Branch."
-      Clear-Backoff
+function Ensure-ExtraIgnores {
+  try {
+    $infoDir = Join-Path $RepoPath ".git\info"
+    New-Item -ItemType Directory -Force -Path $infoDir | Out-Null
+    $exclude = Join-Path $infoDir "exclude"
+    if (-not (Test-Path $exclude)) { "" | Out-File -FilePath $exclude -Encoding utf8 }
+    $existing = Get-Content $exclude -ErrorAction SilentlyContinue
+    foreach ($p in $ExtraIgnores) {
+      if (-not ($existing -contains $p)) {
+        $p | Out-File -FilePath $exclude -Append -Encoding utf8
+        Log "Added to .git/info/exclude: $p"
+      }
+    }
+  } catch {
+    Log "WARN: Could not update .git/info/exclude: $($_.Exception.Message)"
+  }
+}
+
+# Wrapper to run git and capture text output + exit code
+function RunGit {
+  param([string[]]$argv)
+  if ($null -eq $argv -or $argv.Count -eq 0) {
+    Log "WARN: RunGit called with no args"
+    return @{ code = 1; out = @("RunGit: no args") }
+  }
+  try {
+    $out = & $Git @argv 2>&1
+    $lines = @()
+    if ($out -is [array]) { $lines = $out } elseif ($out -ne $null) { $lines = @("$out") }
+    foreach ($l in $lines) { LogGit $l }
+    $exit = $LASTEXITCODE
+    if ($exit -eq $null) { $exit = 0 }
+    return @{ code = [int]$exit; out = $lines }
+  } catch {
+    Log "SYNC-ERROR: $($_.Exception.Message)"
+    return @{ code = 1; out = @("EXCEPTION: $($_.Exception.Message)") }
+  }
+}
+
+function Get-Divergence {
+  # fetch, then left-right count: remoteAhead (left) / localAhead (right)
+  [void](RunGit @("fetch","origin",$Branch))
+  $res = RunGit @("rev-list","--left-right","--count","origin/$Branch...HEAD")
+  if ($res.code -ne 0 -or $res.out.Count -eq 0) { return @{ ra=0; la=0 } }
+  $parts = ($res.out[-1] -split '\s+')
+  $ra = 0; $la = 0
+  if ($parts.Length -ge 2) {
+    [void][int]::TryParse($parts[0], [ref]$ra)
+    [void][int]::TryParse($parts[1], [ref]$la)
+  }
+  Log ("Divergence: remoteAhead=$ra, localAhead=$la")
+  return @{ ra=$ra; la=$la }
+}
+
+function WorkingTreeClean {
+  $st = RunGit @("status","--porcelain","-uall")
+  return ($st.code -eq 0 -and ($st.out -eq $null -or $st.out.Count -eq 0))
+}
+
+# Try safe auto-pull (only when remote is ahead and you aren't)
+function Try-AutoPull {
+  param([int]$remoteAhead, [int]$localAhead)
+  if ($remoteAhead -gt 0 -and $localAhead -eq 0) {
+    # If dirty, autostash will save/restore local edits around rebase
+    $pull = RunGit @("pull","--rebase","--autostash","origin",$Branch)
+    if ($pull.code -ne 0) {
+      # Clean up any aborted attempt
+      [void](RunGit @("rebase","--abort"))
+      Log "WARN: Auto-pull failed. Leaving repo unchanged."
+      return $false
+    }
+    return $true
+  }
+  return $false
+}
+
+# --- MAIN -------------------------------------------------------------
+# Single-instance guard
+$created = $false
+try {
+  $mutex = New-Object System.Threading.Mutex($false, $MutexName, [ref]$created)
+  if (-not $created) { Log "Another v11 instance is running. Exiting."; return }
+} catch {
+  Log "WARN: Could not create/open mutex ($MutexName): $($_.Exception.Message)"
+}
+
+Ensure-RepoReady
+Ensure-ExtraIgnores
+Rotate-LogIfNeeded
+
+Log ("Watcher v11 (polling+batch) started | repo=$RepoPath | branch=$Branch | poll=${PollMs}ms | git=$Git")
+# Print git version once
+[void](RunGit @("version"))
+
+# Batch state
+$lastStableSnapshot  = ""
+$lastChangeAt        = [datetime]::MinValue
+
+while ($true) {
+  try {
+    Rotate-LogIfNeeded
+
+    Set-Location $RepoPath
+
+    # 1) Detect pending changes
+    $st = RunGit @("status","--porcelain","-uall")
+    $snapshot = ($st.out -join "`n")
+
+    if ($st.code -eq 0 -and ($st.out -ne $null -and $st.out.Count -gt 0)) {
+      # Changes exist
+      if ($snapshot -ne $lastStableSnapshot) {
+        $lastStableSnapshot = $snapshot
+        $lastChangeAt = Get-Date
+      }
+
+      $since = 0
+      if ($lastChangeAt -ne [datetime]::MinValue) {
+        $since = (New-TimeSpan -Start $lastChangeAt -End (Get-Date)).TotalSeconds
+      }
+
+      if ($since -ge $BatchQuietSeconds) {
+        # 2) Commit (batch window quiet)
+        # Clear any stale rebase
+        [void](RunGit @("rebase","--abort"))
+
+        [void](RunGit @("add","-A"))
+        $msg = "auto-sync: " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        $cm = RunGit @("commit","-m",$msg)
+
+        if ($cm.code -eq 0) {
+          Log ("Committed: " + $msg)
+
+          # 3) Pull if remote ahead (safe) then push if we're ahead
+          $div = Get-Divergence
+          [void](Try-AutoPull -remoteAhead $div.ra -localAhead $div.la)
+
+          $div2 = Get-Divergence
+          if ($div2.la -gt 0 -and $div2.ra -eq 0) {
+            $ps = RunGit @("push","origin",$Branch)
+            if ($ps.code -eq 0) {
+              Log ("Pushed OK: " + $msg)
+            } else {
+              Log "PUSH-ERROR (see lines above)."
+            }
+          }
+
+          # Reset batch state after successful commit cycle
+          $lastStableSnapshot = ""
+          $lastChangeAt       = [datetime]::MinValue
+        } else {
+          # Probably nothing to commit (e.g., chmod only), keep watching
+        }
+
+      } else {
+        # still within quiet window; do nothing this tick
+      }
+
     } else {
-      Log "WARN: ff-only merge exit $LASTEXITCODE"
-      Start-Backoff
+      # No local changes – consider remote updates and push-if-needed
+      $div = Get-Divergence
+
+      # Safe auto-pull if we're clean and only remote is ahead
+      if (WorkingTreeClean) {
+        [void](Try-AutoPull -remoteAhead $div.ra -localAhead $div.la)
+      }
+
+      # If for some reason we have unpushed commits but remote not ahead, push
+      $div2 = Get-Divergence
+      if ($div2.la -gt 0 -and $div2.ra -eq 0) {
+        $ps = RunGit @("push","origin",$Branch)
+        if ($ps.code -eq 0) {
+          Log ("Pushed OK: existing local commits")
+        } else {
+          Log "PUSH-ERROR (see lines above)."
+        }
+      }
+
+      # Reset batch state; nothing pending
+      $lastStableSnapshot = ""
+      $lastChangeAt       = [datetime]::MinValue
     }
-  } elseif ($ra -eq 0 -and $la -eq 0) {
-    # in sync
-  } else {
-    Log "DIVERGED: remote+$ra, local+$la. Manual merge/rebase required. Backing off."
-    if ($madeCommit) {
-      [void](Run-Git -argv @('reset','--soft','HEAD~1'))
-      Log "Undid last auto commit (changes kept staged)."
-    }
-    Start-Backoff
+
+  } catch {
+    Log "SYNC-ERROR: $($_.Exception.Message)"
+    # keep loop alive
   }
 
   Start-Sleep -Milliseconds $PollMs
