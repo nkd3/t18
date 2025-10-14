@@ -1,0 +1,31 @@
+﻿[Unit]
+Description=T18 Relay (SEBI-compliant order gateway)
+After=network.target t18-secret.service
+Wants=t18-secret.service
+
+[Service]
+Type=simple
+User=t18svc
+Group=t18svc
+Environment=BIND_HOST=127.0.0.1
+Environment=BIND_PORT=51839
+Environment=DH_BASE_URL=https://api.dhan.co
+Environment=CLIENT_ID=${CLIENT_ID}
+Environment=SECRET_URL=http://127.0.0.1:51840/secret/read
+Environment=DEBUG=1
+ExecStart=/usr/bin/python3 /opt/t18-relay/relay.py
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/opt/t18-relay
+
+[Install]
+WantedBy=multi-user.target
