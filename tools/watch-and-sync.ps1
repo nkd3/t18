@@ -1,9 +1,10 @@
 <#
-T18 Auto Watch & Sync – v10.2 (PS5, POLLING, absolute git, conflict-averse)
-- Polls every 5s; commit local changes, fetch, ff-only or push.
-- No auto-rebase; if diverged, log + short backoff (no exceptions).
-- Logs OUTSIDE repo: %LOCALAPPDATA%\T18\logs\sync.log
-- Single-instance via mutex.
+T18 Auto Watch & Sync – v10.3 (PS5 stable)
+- Poll every 5s; commit local changes, fetch, ff-only or push.
+- No auto-rebase; if diverged, log and short backoff.
+- Uses Start-Process to run git => no NativeCommandError.
+- Logs outside repo: %LOCALAPPDATA%\T18\logs\sync.log
+- Single instance via mutex.
 #>
 
 $ErrorActionPreference = "Stop"
@@ -22,27 +23,43 @@ $LogDir      = Join-Path $env:LOCALAPPDATA "T18\logs"
 $LogFile     = Join-Path $LogDir "sync.log"
 $BackoffFile = Join-Path $LogDir "rebase_backoff.txt"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-
 function Log([string]$msg) {
   $stamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
   "$stamp  $msg" | Out-File -FilePath $LogFile -Append -Encoding utf8
 }
 
 # --- single instance ---
-$mutexName = "Global\T18WatchSyncV102"
+$mutexName = "Global\T18WatchSyncV103"
 $created = $false
 $mutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$created)
-if (-not $mutex.WaitOne(0, $false)) {
-  Log "Another v10.2 instance already running. Exiting."
-  exit 0
-}
+if (-not $mutex.WaitOne(0, $false)) { Log "Another v10.3 instance is running. Exiting."; exit 0 }
 
-# --- helper: explicit argv param (no PS5 magic), never throws ---
+# --- safe git runner (no PS NativeCommandError) ---
+function Join-Args {
+  param([string[]]$items)
+  $items | ForEach-Object {
+    if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+  } | Out-String
+}
 function Run-Git {
   param([Parameter(Mandatory=$true)][string[]]$argv)
-  $out = & $Git @argv 2>&1
-  if ($out) { $out | ForEach-Object { Log "git> $_" } }
-  return $LASTEXITCODE
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $Git
+  # Build a safe single-string Args (git.exe parses spaces)
+  $psi.Arguments = ([string]::Join(' ', ($argv | ForEach-Object {
+    if ($_ -match '[\s"]') { '"' + ($_ -replace '"','\"') + '"' } else { $_ }
+  })))
+  $psi.UseShellExecute = $false
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError  = $true
+  $psi.CreateNoWindow = $true
+  $p = [System.Diagnostics.Process]::Start($psi)
+  $stdout = $p.StandardOutput.ReadToEnd()
+  $stderr = $p.StandardError.ReadToEnd()
+  $p.WaitForExit()
+  if ($stdout) { ($stdout -split "`r?`n") | Where-Object { $_ -ne '' } | ForEach-Object { Log "git> $_" } }
+  if ($stderr) { ($stderr -split "`r?`n") | Where-Object { $_ -ne '' } | ForEach-Object { Log "git> $_" } }
+  return $p.ExitCode
 }
 
 function In-Backoff {
@@ -57,9 +74,7 @@ function Start-Backoff {
   $until.ToString("o") | Out-File -FilePath $BackoffFile -Encoding utf8 -Force
   Log "Entering backoff until $($until.ToString('HH:mm:ss'))."
 }
-function Clear-Backoff {
-  if (Test-Path $BackoffFile) { Remove-Item $BackoffFile -Force -ErrorAction SilentlyContinue }
-}
+function Clear-Backoff { if (Test-Path $BackoffFile) { Remove-Item $BackoffFile -Force -ErrorAction SilentlyContinue } }
 function Get-Divergence {
   [void](Run-Git -argv @('fetch','origin',$Branch))
   $out = & $Git rev-list --left-right --count "origin/$Branch...HEAD" 2>$null
@@ -68,7 +83,7 @@ function Get-Divergence {
   return @{ RemoteAhead = [int]$p[0]; LocalAhead = [int]$p[1] }
 }
 
-# --- repo/branch/one-time configs ---
+# --- repo/branch, one-time configs ---
 if (-not (Test-Path $RepoPath)) { throw "Repo path not found: $RepoPath" }
 Set-Location $RepoPath
 try {
@@ -76,14 +91,14 @@ try {
   if ($cur -ne $Branch) { Log "Switching to $Branch (was $cur)"; [void](Run-Git -argv @('checkout','-B',$Branch)) }
 } catch { Log "WARN: Cannot read current branch: $($_.Exception.Message)" }
 
-# Silence CRLF advice in this repo (prevents the noisy LF→CRLF warning)
+# silence CRLF noise for this repo
 [void](Run-Git -argv @('config','core.autocrlf','true'))
 [void](Run-Git -argv @('config','core.safecrlf','false'))
 
-Log "Watcher v10.2 (polling) started | repo=$RepoPath | branch=$Branch | poll=${PollMs}ms | git=$Git"
+Log "Watcher v10.3 (polling) started | repo=$RepoPath | branch=$Branch | poll=${PollMs}ms | git=$Git"
 [void](Run-Git -argv @('--version'))
 
-# --- main loop (no blanket try/catch; handle per-call) ---
+# --- main loop ---
 while ($true) {
   # 1) Commit local changes (respects .gitignore)
   $status = & $Git status --porcelain
@@ -95,12 +110,8 @@ while ($true) {
       if ((Run-Git -argv @('commit','-m',$msg)) -eq 0) {
         $madeCommit = $true
         Log "Committed: $msg"
-      } else {
-        Log "WARN: commit returned exit $LASTEXITCODE"
-      }
-    } else {
-      Log "WARN: add returned exit $LASTEXITCODE"
-    }
+      } else { Log "WARN: commit exit $LASTEXITCODE" }
+    } else { Log "WARN: add exit $LASTEXITCODE" }
   }
 
   # 2) Divergence
@@ -113,19 +124,17 @@ while ($true) {
     if ((Run-Git -argv @('push','origin',$Branch)) -eq 0) {
       if ($msg) { Log ("Pushed OK: " + $msg) } else { Log "Pushed OK: existing local commits" }
       Clear-Backoff
-    } else {
-      Log "WARN: push returned exit $LASTEXITCODE"
-    }
+    } else { Log "WARN: push exit $LASTEXITCODE" }
   } elseif ($ra -gt 0 -and $la -eq 0) {
     if ((Run-Git -argv @('merge','--ff-only',"origin/$Branch")) -eq 0) {
       Log "Fast-forwarded to origin/$Branch."
       Clear-Backoff
     } else {
-      Log "WARN: ff-only merge returned exit $LASTEXITCODE"
+      Log "WARN: ff-only merge exit $LASTEXITCODE"
       Start-Backoff
     }
   } elseif ($ra -eq 0 -and $la -eq 0) {
-    # In sync
+    # in sync
   } else {
     Log "DIVERGED: remote+$ra, local+$la. Manual merge/rebase required. Backing off."
     if ($madeCommit) {
