@@ -1,4 +1,4 @@
-# T18 — AutoSync Implementation (Windows, SEBI-Aligned)
+# T18 — Automate Dhan instrument master refresh AutoSync Implementation (Windows, SEBI-Aligned)
 
 `C:\T18\docs\DOCUMENTATION\AutoSync Implementation.md`
 
