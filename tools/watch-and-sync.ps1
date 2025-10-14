@@ -1,7 +1,7 @@
 <#
-T18 Auto Watch & Sync – v10 (PS5, POLLING, absolute git, conflict-averse)
-- Polls every 5s; commits local changes, fetches, ff-only or pushes.
-- No auto-rebase; if diverged, logs + short backoff.
+T18 Auto Watch & Sync – v10.2 (PS5, POLLING, absolute git, conflict-averse)
+- Polls every 5s; commit local changes, fetch, ff-only or push.
+- No auto-rebase; if diverged, log + short backoff (no exceptions).
 - Logs OUTSIDE repo: %LOCALAPPDATA%\T18\logs\sync.log
 - Single-instance via mutex.
 #>
@@ -29,15 +29,15 @@ function Log([string]$msg) {
 }
 
 # --- single instance ---
-$mutexName = "Global\T18WatchSyncV10"
+$mutexName = "Global\T18WatchSyncV102"
 $created = $false
 $mutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$created)
 if (-not $mutex.WaitOne(0, $false)) {
-  Log "Another v10 instance already running. Exiting."
+  Log "Another v10.2 instance already running. Exiting."
   exit 0
 }
 
-# --- helper: explicit -argv param (no PS5 magic) ---
+# --- helper: explicit argv param (no PS5 magic), never throws ---
 function Run-Git {
   param([Parameter(Mandatory=$true)][string[]]$argv)
   $out = & $Git @argv 2>&1
@@ -61,80 +61,79 @@ function Clear-Backoff {
   if (Test-Path $BackoffFile) { Remove-Item $BackoffFile -Force -ErrorAction SilentlyContinue }
 }
 function Get-Divergence {
-  Run-Git -argv @('fetch','origin',$Branch) | Out-Null
+  [void](Run-Git -argv @('fetch','origin',$Branch))
   $out = & $Git rev-list --left-right --count "origin/$Branch...HEAD" 2>$null
   if (-not $out) { return @{ RemoteAhead = 0; LocalAhead = 0 } }
   $p = $out -split "\s+"
   return @{ RemoteAhead = [int]$p[0]; LocalAhead = [int]$p[1] }
 }
 
-# --- repo/branch ---
+# --- repo/branch/one-time configs ---
 if (-not (Test-Path $RepoPath)) { throw "Repo path not found: $RepoPath" }
 Set-Location $RepoPath
 try {
   $cur = (& $Git rev-parse --abbrev-ref HEAD).Trim()
-  if ($cur -ne $Branch) { Log "Switching to $Branch (was $cur)"; Run-Git -argv @('checkout','-B',$Branch) | Out-Null }
+  if ($cur -ne $Branch) { Log "Switching to $Branch (was $cur)"; [void](Run-Git -argv @('checkout','-B',$Branch)) }
 } catch { Log "WARN: Cannot read current branch: $($_.Exception.Message)" }
 
-Log "Watcher v10 (polling) started | repo=$RepoPath | branch=$Branch | poll=${PollMs}ms | git=$Git"
-Run-Git -argv @('--version') | Out-Null
+# Silence CRLF advice in this repo (prevents the noisy LF→CRLF warning)
+[void](Run-Git -argv @('config','core.autocrlf','true'))
+[void](Run-Git -argv @('config','core.safecrlf','false'))
 
-# --- main loop ---
+Log "Watcher v10.2 (polling) started | repo=$RepoPath | branch=$Branch | poll=${PollMs}ms | git=$Git"
+[void](Run-Git -argv @('--version'))
+
+# --- main loop (no blanket try/catch; handle per-call) ---
 while ($true) {
-  try {
-    if (In-Backoff) {
-      Log "Backoff active; skipping poll."
-      Start-Sleep -Milliseconds $PollMs
-      continue
-    }
-
-    # 1) Commit local changes (respects .gitignore)
-    $status = & $Git status --porcelain
-    $madeCommit = $false
-    $msg = $null
-    if (-not [string]::IsNullOrWhiteSpace($status)) {
-      Run-Git -argv @('add','-A') | Out-Null
+  # 1) Commit local changes (respects .gitignore)
+  $status = & $Git status --porcelain
+  $madeCommit = $false
+  $msg = $null
+  if (-not [string]::IsNullOrWhiteSpace($status)) {
+    if ((Run-Git -argv @('add','-A')) -eq 0) {
       $msg = "auto-sync: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
       if ((Run-Git -argv @('commit','-m',$msg)) -eq 0) {
         $madeCommit = $true
         Log "Committed: $msg"
-      }
-    }
-
-    # 2) Divergence
-    $div = Get-Divergence
-    $ra = $div.RemoteAhead
-    $la = $div.LocalAhead
-    Log "Divergence: remoteAhead=$ra, localAhead=$la"
-
-    if ($ra -eq 0 -and $la -gt 0) {
-      if ((Run-Git -argv @('push','origin',$Branch)) -eq 0) {
-        if ($msg) { Log ("Pushed OK: " + $msg) } else { Log "Pushed OK: existing local commits" }
-        Clear-Backoff
       } else {
-        Log "PUSH-ERROR (exit $LASTEXITCODE)."
+        Log "WARN: commit returned exit $LASTEXITCODE"
       }
-    } elseif ($ra -gt 0 -and $la -eq 0) {
-      if ((Run-Git -argv @('merge','--ff-only',"origin/$Branch")) -eq 0) {
-        Log "Fast-forwarded to origin/$Branch."
-        Clear-Backoff
-      } else {
-        Log "FF-ERROR (exit $LASTEXITCODE)."
-        Start-Backoff
-      }
-    } elseif ($ra -eq 0 -and $la -eq 0) {
-      # In sync
     } else {
-      Log "DIVERGED: remote+$ra, local+$la. Manual merge/rebase required. Backing off."
-      if ($madeCommit) {
-        Run-Git -argv @('reset','--soft','HEAD~1') | Out-Null
-        Log "Undid last auto commit (changes kept staged)."
-      }
+      Log "WARN: add returned exit $LASTEXITCODE"
+    }
+  }
+
+  # 2) Divergence
+  $div = Get-Divergence
+  $ra = $div.RemoteAhead
+  $la = $div.LocalAhead
+  Log "Divergence: remoteAhead=$ra, localAhead=$la"
+
+  if ($ra -eq 0 -and $la -gt 0) {
+    if ((Run-Git -argv @('push','origin',$Branch)) -eq 0) {
+      if ($msg) { Log ("Pushed OK: " + $msg) } else { Log "Pushed OK: existing local commits" }
+      Clear-Backoff
+    } else {
+      Log "WARN: push returned exit $LASTEXITCODE"
+    }
+  } elseif ($ra -gt 0 -and $la -eq 0) {
+    if ((Run-Git -argv @('merge','--ff-only',"origin/$Branch")) -eq 0) {
+      Log "Fast-forwarded to origin/$Branch."
+      Clear-Backoff
+    } else {
+      Log "WARN: ff-only merge returned exit $LASTEXITCODE"
       Start-Backoff
     }
-
-  } catch {
-    Log "SYNC-ERROR: $($_.Exception.Message)"
+  } elseif ($ra -eq 0 -and $la -eq 0) {
+    # In sync
+  } else {
+    Log "DIVERGED: remote+$ra, local+$la. Manual merge/rebase required. Backing off."
+    if ($madeCommit) {
+      [void](Run-Git -argv @('reset','--soft','HEAD~1'))
+      Log "Undid last auto commit (changes kept staged)."
+    }
+    Start-Backoff
   }
+
   Start-Sleep -Milliseconds $PollMs
 }
