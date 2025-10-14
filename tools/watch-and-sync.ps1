@@ -1,36 +1,44 @@
-<# 
-T18 Auto Watch & Sync (Windows)
-- Watches C:\T18 (recursively) for changes.
-- Debounces bursts, then: commit -> fast-forward/push/rebase as needed.
-- Respects .gitignore via `git status --porcelain`.
-- Logs to C:\T18\logs\sync.log
-- Single-instance; backs off after conflicts.
+<#
+T18 Auto Watch & Sync – v7 (PS5, POLLING, absolute git, conflict-averse)
+- No FileSystemWatcher, no timers. Polls every 5s = rock solid.
+- On each poll:
+    * Commit local changes (respects .gitignore)
+    * git fetch
+    * If local ahead only  -> push
+    * If remote ahead only -> fast-forward (ff-only)
+    * If diverged          -> log + backoff (no auto-rebase)
+- Logs OUTSIDE the repo: %LOCALAPPDATA%\T18\logs\sync.log
+- Single-instance mutex.
 #>
 
 $ErrorActionPreference = "Stop"
 
 # --- settings ---
-$RepoPath   = "C:\T18"
-$Branch     = "main"
-$DebounceMs = 7000
-$BackoffSec = 120         # backoff after a rebase conflict
-$LogDir     = Join-Path $RepoPath "logs"
-$LogFile    = Join-Path $LogDir "sync.log"
-$BackoffFile= Join-Path $LogDir "rebase_backoff.txt"
+$RepoPath    = "C:\T18"
+$Branch      = "main"
+$PollMs      = 5000
+$BackoffSec  = 120
 
-# --- logging ---
+# --- git path (absolute) ---
+$Git = (Get-Command git.exe -ErrorAction Stop).Source  # e.g. C:\Program Files\Git\cmd\git.exe
+
+# --- logs outside repo ---
+$LogDir      = Join-Path $env:LOCALAPPDATA "T18\logs"
+$LogFile     = Join-Path $LogDir "sync.log"
+$BackoffFile = Join-Path $LogDir "rebase_backoff.txt"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+
 function Log([string]$msg) {
   $stamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
   "$stamp  $msg" | Out-File -FilePath $LogFile -Append -Encoding utf8
 }
 
-# --- single instance guard ---
-$mutexName = "Global\T18WatchSync"
+# --- single instance ---
+$mutexName = "Global\T18WatchSyncV7"
 $created = $false
 $mutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$created)
 if (-not $mutex.WaitOne(0, $false)) {
-  Log "Another watcher instance already running. Exiting."
+  Log "Another v7 instance already running. Exiting."
   exit 0
 }
 
@@ -50,124 +58,78 @@ function Start-Backoff {
 function Clear-Backoff {
   if (Test-Path $BackoffFile) { Remove-Item $BackoffFile -Force -ErrorAction SilentlyContinue }
 }
-
-# --- ensure repo exists/branch ---
-if (-not (Test-Path $RepoPath)) { throw "Repo path not found: $RepoPath" }
-Set-Location $RepoPath
-try {
-  $cur = (git rev-parse --abbrev-ref HEAD).Trim()
-  if ($cur -ne $Branch) { Log "Switching to $Branch (was $cur)"; git checkout -B $Branch | Out-Null }
-} catch { Log "WARN: Could not determine current branch: $($_.Exception.Message)" }
-
-# --- debounce timer setup ---
-$timer = New-Object Timers.Timer
-$timer.Interval = $DebounceMs
-$timer.AutoReset = $false
-$syncLock = New-Object object
-$isSyncing = $false
-
-# --- divergence probe ---
+function RunGit([string[]]$args) {
+  # Use absolute git path + explicit argument array
+  $out = & $Git @args 2>&1
+  if ($out) { $out | ForEach-Object { Log "git> $_" } }
+  return $LASTEXITCODE
+}
 function Get-Divergence {
-  # returns @{RemoteAhead=<int>; LocalAhead=<int>}
-  git fetch origin $Branch | Out-Null
-  $out = git rev-list --left-right --count origin/$Branch...HEAD
-  # format: "<remoteAhead>\t<localAhead>"
+  RunGit @('fetch','origin',$Branch) | Out-Null
+  $out = & $Git rev-list --left-right --count "origin/$Branch...HEAD" 2>$null
+  if (-not $out) { return @{ RemoteAhead = 0; LocalAhead = 0 } }
   $parts = $out -split "\s+"
   return @{ RemoteAhead = [int]$parts[0]; LocalAhead = [int]$parts[1] }
 }
 
-# --- core sync ---
-function Do-Sync {
-  if ($isSyncing) { return }
-  $isSyncing = $true
+# --- repo/branch ---
+if (-not (Test-Path $RepoPath)) { throw "Repo path not found: $RepoPath" }
+Set-Location $RepoPath
+try {
+  $cur = (& $Git rev-parse --abbrev-ref HEAD).Trim()
+  if ($cur -ne $Branch) { Log "Switching to $Branch (was $cur)"; RunGit @('checkout','-B',$Branch) | Out-Null }
+} catch { Log "WARN: Cannot read current branch: $($_.Exception.Message)" }
+
+Log "Watcher v7 (polling) started on $RepoPath, branch=$Branch, poll=${PollMs}ms (logs at $LogFile)"
+
+# --- loop ---
+while ($true) {
   try {
-    Set-Location $RepoPath
+    if (In-Backoff) { Log "Backoff active; skipping this poll."; Start-Sleep -Milliseconds $PollMs; continue }
 
-    if (In-Backoff) {
-      Log "Backoff active; skipping sync."
-      return
-    }
+    # Defensive: abort any stale rebase
+    RunGit @('rebase','--abort') | Out-Null
 
-    try { git rebase --abort | Out-Null } catch {}
-
-    $status = git status --porcelain
+    # 1) Commit local changes (respects .gitignore)
+    $status = & $Git status --porcelain
+    $madeCommit = $false
+    $msg = $null
     if (-not [string]::IsNullOrWhiteSpace($status)) {
-      # commit local changes first
-      git add -A | Out-Null
+      RunGit @('add','-A') | Out-Null
       $msg = "auto-sync: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-      git commit -m $msg | Out-Null
-    } else {
-      $msg = $null
+      if ((RunGit @('commit','-m',$msg)) -eq 0) { $madeCommit = $true; Log "Committed: $msg" }
     }
 
-    # analyze divergence
+    # 2) Divergence
     $div = Get-Divergence
     $ra = $div.RemoteAhead
     $la = $div.LocalAhead
+    Log "Divergence: remoteAhead=$ra, localAhead=$la"
 
     if ($ra -eq 0 -and $la -gt 0) {
-      # origin not ahead; just push our commits
-      try { git push origin $Branch | Out-Null; Log "Pushed OK: ${msg:-no-op}" } catch { Log "PUSH-ERROR: $($_.Exception.Message)" }
-      Clear-Backoff
-      return
-    }
-
-    if ($ra -gt 0 -and $la -eq 0) {
-      # we have no local commits; fast-forward
-      try { git merge --ff-only origin/$Branch | Out-Null; Log "Fast-forwarded to origin/$Branch." } catch { Log "FF-ERROR: $($_.Exception.Message)"; return }
-      Clear-Backoff
-      return
-    }
-
-    if ($ra -eq 0 -and $la -eq 0) {
-      Log "No changes to commit."
-      Clear-Backoff
-      return
-    }
-
-    # both sides ahead -> need rebase
-    try {
-      git rebase origin/$Branch | Out-Null
-      try { git push origin $Branch | Out-Null; Log "Rebased & pushed OK: ${msg:-rebased}" } catch { Log "PUSH-ERROR: $($_.Exception.Message)" }
-      Clear-Backoff
-    } catch {
-      Log "REBASE-CONFLICT: $($_.Exception.Message)"
-      try { git rebase --abort | Out-Null } catch {}
-      # Roll back last commit if we just created one, keep changes staged
-      try { if ($msg) { git reset --soft HEAD~1 | Out-Null } } catch {}
-      Log "Rebase conflict. Last commit undone (changes kept). Manual resolution required."
+      if ((RunGit @('push','origin',$Branch)) -eq 0) {
+        if ($msg) { Log "Pushed OK: $msg" } else { Log "Pushed OK: existing local commits" }
+        Clear-Backoff
+      } else {
+        Log "PUSH-ERROR (exit $LASTEXITCODE)."
+      }
+    } elseif ($ra -gt 0 -and $la -eq 0) {
+      if ((RunGit @('merge','--ff-only',"origin/$Branch")) -eq 0) {
+        Log "Fast-forwarded to origin/$Branch."
+        Clear-Backoff
+      } else {
+        Log "FF-ERROR (exit $LASTEXITCODE)."
+        Start-Backoff
+      }
+    } elseif ($ra -eq 0 -and $la -eq 0) {
+      # In sync; nothing to do
+    } else {
+      Log "DIVERGED: remote+$ra, local+$la. Manual merge/rebase required. Backing off."
+      if ($madeCommit) { RunGit @('reset','--soft','HEAD~1') | Out-Null; Log "Undid last auto commit (changes kept staged)." }
       Start-Backoff
-      return
     }
-
   } catch {
     Log "SYNC-ERROR: $($_.Exception.Message)"
-  } finally {
-    $isSyncing = $false
   }
+  Start-Sleep -Milliseconds $PollMs
 }
-
-# --- watcher ---
-$fsw = New-Object System.IO.FileSystemWatcher
-$fsw.Path = $RepoPath
-$fsw.IncludeSubdirectories = $true
-$fsw.NotifyFilter = [IO.NotifyFilters]'FileName, DirectoryName, LastWrite, Size, Attributes'
-
-function Should-Ignore($path) {
-  if ([string]::IsNullOrEmpty($path)) { return $false }
-  $p = $path.ToLower()
-  return $p.Contains("\.git\")
-}
-function Restart-Timer { [System.Threading.Monitor]::Enter($syncLock); try { $timer.Stop(); $timer.Start() } finally { [System.Threading.Monitor]::Exit($syncLock) } }
-
-Register-ObjectEvent -InputObject $fsw -EventName Changed -Action { if (-not (Should-Ignore $Event.SourceEventArgs.FullPath)) { Restart-Timer } } | Out-Null
-Register-ObjectEvent -InputObject $fsw -EventName Created -Action { if (-not (Should-Ignore $Event.SourceEventArgs.FullPath)) { Restart-Timer } } | Out-Null
-Register-ObjectEvent -InputObject $fsw -EventName Deleted -Action { if (-not (Should-Ignore $Event.SourceEventArgs.FullPath)) { Restart-Timer } } | Out-Null
-Register-ObjectEvent -InputObject $fsw -EventName Renamed -Action { if (-not (Should-Ignore $Event.SourceEventArgs.FullPath)) { Restart-Timer } } | Out-Null
-
-Register-ObjectEvent -InputObject $timer -EventName Elapsed -Action { Do-Sync } | Out-Null
-
-$fsw.EnableRaisingEvents = $true
-Log "Watcher started on $RepoPath, branch=$Branch, debounce=${DebounceMs}ms"
-
-while ($true) { Start-Sleep -Seconds 5 }
