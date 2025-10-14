@@ -8,6 +8,18 @@ $VpsUser = "t18svc"                # your VPS user
 $VpsHost = "YOUR.VPS.IP.ADDR"      # <-- replace with your real Vultr IPv4
 # --------------------------------
 
+if ($VpsHost -match '^YOUR\.VPS\.IP\.ADDR$') {
+  Write-Host "ERROR: You must set `$VpsHost to your real VPS IPv4." -ForegroundColor Red
+  exit 1
+}
+
+# Ensure ssh.exe exists
+$ssh = (Get-Command ssh -ErrorAction SilentlyContinue)
+if (-not $ssh) {
+  Write-Host "ERROR: 'ssh' not found. Install OpenSSH Client (Windows Optional Feature) and retry." -ForegroundColor Red
+  exit 1
+}
+
 $LocalPort = 51839
 $LogDir    = "C:\T18\data\logs"
 $LogFile   = Join-Path $LogDir "relay_selftest.log"
@@ -20,11 +32,15 @@ function Write-Log {
 }
 
 function Wait-Port {
-  param([string]$Host, [int]$Port, [int]$TimeoutSec = 15)
+  param(
+    [string]$HostName,
+    [int]$Port,
+    [int]$TimeoutSec = 15
+  )
   $deadline = (Get-Date).AddSeconds($TimeoutSec)
   do {
     try {
-      $ok = Test-NetConnection -ComputerName $Host -Port $Port -WarningAction SilentlyContinue
+      $ok = Test-NetConnection -ComputerName $HostName -Port $Port -WarningAction SilentlyContinue
       if ($ok.TcpTestSucceeded) { return $true }
     } catch {}
     Start-Sleep -Milliseconds 400
@@ -37,7 +53,6 @@ Write-Log "---- T18 Relay self-test start ----"
 # 1) Ensure SSH tunnel to VPS:127.0.0.1:51839 -> local 127.0.0.1:51839
 $bound = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort $LocalPort -ErrorAction SilentlyContinue
 if (-not $bound) {
-  # Start tunnel in background
   Write-Log "Starting SSH tunnel to $VpsUser@$VpsHost for $LocalPort ..."
   Start-Process -WindowStyle Hidden -FilePath "ssh" -ArgumentList "-L $LocalPort:127.0.0.1:$LocalPort $VpsUser@$VpsHost -N"
   Start-Sleep -Seconds 2
@@ -46,15 +61,19 @@ if (-not $bound) {
 }
 
 # 2) Verify local port answers
-if (-not (Wait-Port -Host "127.0.0.1" -Port $LocalPort -TimeoutSec 15)) {
+if (-not (Wait-Port -HostName "127.0.0.1" -Port $LocalPort -TimeoutSec 15)) {
   Write-Log "ERROR: SSH tunnel to $VpsHost not available on 127.0.0.1:$LocalPort"
-  Write-Host "Tunnel check failed. Ensure you replaced YOUR.VPS.IP.ADDR and that SSH works:  ssh $VpsUser@$VpsHost"
+  Write-Host "Tunnel check failed. Verify:  ssh $VpsUser@$VpsHost" -ForegroundColor Red
   exit 1
 }
 
-# 3) Helper to run curl with status capture
+# 3) Helper to run curl with status capture (body + HTTP code)
 function Invoke-Curl {
-  param([string]$Url, [string]$Method = "GET", [string]$JsonBody = $null)
+  param(
+    [string]$Url,
+    [ValidateSet('GET','POST')] [string]$Method = "GET",
+    [string]$JsonBody = $null
+  )
   $tmp = New-TemporaryFile
   try {
     if ($Method -eq "GET") {
