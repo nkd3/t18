@@ -1,4 +1,9 @@
-﻿# C:\T18\scripts\T18.SecurityId.ps1
+﻿# Create scripts dir if missing
+New-Item -ItemType Directory -Force -Path "C:\T18\scripts" | Out-Null
+
+# Overwrite the mapper with a PS 5.1–compatible version (no '??')
+@'
+# C:\T18\scripts\T18.SecurityId.ps1
 # T18 — Dhan instruments CSV loader + symbol→securityId mapper + dhBody builders (Windows-native, PowerShell 5.1)
 
 Set-StrictMode -Version Latest
@@ -213,3 +218,4 @@ function New-T18DhBody {
 
   return @{ dhBody = $body }
 }
+'@ | Set-Content -LiteralPath "C:\T18\scripts\T18.SecurityId.ps1" -Encoding UTF8
