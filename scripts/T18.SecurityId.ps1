@@ -1,5 +1,9 @@
-﻿# OVERWRITE: C:\T18\scripts\T18.SecurityId.ps1
-# T18 — Dhan instruments CSV loader + symbol→securityId mapper + dhBody builders (Windows-native, PowerShell 5.1)
+﻿# C:\T18\scripts\T18.SecurityId.ps1
+# T18 — Dhan instruments CSV loader + symbol→securityId mapper (PowerShell 5.1)
+# Uses Dhan headers:
+#   SEM_EXM_EXCH_ID, SEM_SEGMENT, SEM_SMST_SECURITY_ID, SEM_INSTRUMENT_NAME,
+#   SEM_TRADING_SYMBOL, SEM_SERIES, SM_SYMBOL_NAME, SEM_EXPIRY_DATE,
+#   SEM_STRIKE_PRICE, SEM_OPTION_TYPE, SEM_LOT_UNITS, SEM_EXCH_INSTRUMENT_TYPE
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -16,82 +20,79 @@ function Write-T18Log([string]$msg) {
   Write-Host "$ts  $msg"
 }
 
-function Normalize-Header([string]$name) {
-  ($name.ToLower() -replace '[^a-z0-9]', '_') -replace '_+', '_'
+function _NormStr($x) { if ($null -eq $x) { "" } else { "$x".Trim() } }
+function _Upper($x)   { $s = _NormStr $x; if ($s -ne "") { $s.ToUpper() } else { "" } }
+
+function _MapExchangeSegment([string]$exch, [string]$seg) {
+  $e = _Upper $exch
+  $s = _Upper $seg
+  if ($e -eq 'NSE' -and $s -eq 'EQ') { return 'NSE' }
+  if ($e -eq 'BSE' -and $s -eq 'EQ') { return 'BSE' }
+  if ($e -eq 'NSE' -and ($s -match 'FNO|FO|DERIV')) { return 'NSE_FNO' }
+  return $e
 }
 
-function Get-FirstDefined {
-  param([hashtable]$Map, [string[]]$Keys, $Default = $null)
-  foreach ($k in $Keys) {
-    if ($Map.ContainsKey($k)) {
-      $v = $Map[$k]
-      if ($null -ne $v -and "$v".Trim() -ne "") { return $v }
-    }
-  }
-  return $Default
-}
+function Normalize-Row($r) {
+  # pull by EXACT header names
+  $exch         = _NormStr $r.'SEM_EXM_EXCH_ID'
+  $segment      = _NormStr $r.'SEM_SEGMENT'
+  $securityId   = _NormStr $r.'SEM_SMST_SECURITY_ID'
+  $instrName    = _NormStr $r.'SEM_INSTRUMENT_NAME'
+  $tradingSym   = _NormStr $r.'SEM_TRADING_SYMBOL'
+  $series       = _NormStr $r.'SEM_SERIES'
+  $smName       = _NormStr $r.'SM_SYMBOL_NAME'
+  $expiry       = _NormStr $r.'SEM_EXPIRY_DATE'
+  $strike       = _NormStr $r.'SEM_STRIKE_PRICE'
+  $optType      = _Upper   $r.'SEM_OPTION_TYPE'
+  $lotUnits     = _NormStr $r.'SEM_LOT_UNITS'
+  $exchInstr    = _NormStr $r.'SEM_EXCH_INSTRUMENT_TYPE'
 
-function Map-Exchange([string]$raw) {
-  if ([string]::IsNullOrWhiteSpace($raw)) { return "" }
-  $v = $raw.Trim().ToUpper()
-  switch -Regex ($v) {
-    '^NSE[_\-]?EQ$'   { return 'NSE' }
-    '^BSE[_\-]?EQ$'   { return 'BSE' }
-    '^(NSEFO|NSE[_\-]?FNO)$' { return 'NSE_FNO' }
-    '^(NSE|BSE)$'     { return $v }
-    default           { return $v }  # leave unknowns as-is
-  }
-}
+  $exchangeOut  = _MapExchangeSegment $exch $segment
 
-function Normalize-Row($row) {
-  $map = @{}
-  foreach ($p in $row.PSObject.Properties) {
-    $n = Normalize-Header $p.Name
-    $map[$n] = $p.Value
+  # symbol preference: SM_SYMBOL_NAME (readable) else SEM_TRADING_SYMBOL
+  $symbol = if ($smName -ne "") { _Upper $smName } else { _Upper $tradingSym }
+
+  $underlying = ""
+  if ($tradingSym -ne "" -and $tradingSym.Contains('-')) {
+    $underlying = _Upper ($tradingSym.Split('-')[0])
   }
 
-  $securityId      = Get-FirstDefined -Map $map -Keys @('securityid','security_id','secid')
-  $symbol          = Get-FirstDefined -Map $map -Keys @('symbol','trading_symbol','scrip')
-  $exchangeRaw     = Get-FirstDefined -Map $map -Keys @('exchangesegment','exchange_segment','exchange')
-  $instrument      = Get-FirstDefined -Map $map -Keys @('instrument','instrument_type','inst_type')
-  $series          = Get-FirstDefined -Map $map -Keys @('series','segment_series')
-  $underlying      = Get-FirstDefined -Map $map -Keys @('underlying','underlying_symbol')
-  $expiry          = Get-FirstDefined -Map $map -Keys @('expiry','expiry_date','exp_date')
-  $strike          = Get-FirstDefined -Map $map -Keys @('strike','strike_price')
-  $optionType      = Get-FirstDefined -Map $map -Keys @('optiontype','option_type','opt_type')
-  $lotSize         = Get-FirstDefined -Map $map -Keys @('lotsize','lot_size','mkt_lot')
-  $tickSize        = Get-FirstDefined -Map $map -Keys @('ticksize','tick_size')
-  $isin            = Get-FirstDefined -Map $map -Keys @('isin')
+  $secId = $null
+  if ($securityId -ne "") { try { $secId = [int]$securityId } catch {} }
 
-  $securityId = if ($securityId -ne $null -and "$securityId".Trim() -ne '') { [int]$securityId } else { $null }
-  $lotSize    = if ($lotSize    -ne $null -and "$lotSize".Trim()    -ne '') { [int]$lotSize }    else { $null }
+  $lot = $null
+  if ($lotUnits -ne "") { try { $lot = [int]([double]$lotUnits) } catch {} }
 
   [pscustomobject]@{
-    securityId      = $securityId
-    symbol          = if ($symbol)          { "$symbol".Trim().ToUpper() }          else { "" }
-    exchangeSegment = Map-Exchange $exchangeRaw
-    instrument      = if ($instrument)      { "$instrument".Trim().ToUpper() }      else { "" }
-    series          = if ($series)          { "$series".Trim().ToUpper() }          else { "" }
-    underlying      = if ($underlying)      { "$underlying".Trim().ToUpper() }      else { "" }
-    expiry          = if ($expiry)          { "$expiry".Trim() }                    else { "" }
+    securityId      = $secId
+    symbol          = $symbol
+    underlying      = $underlying
+    exchangeSegment = $exchangeOut
+    instrument      = _Upper $instrName
+    series          = _Upper $series
+    expiry          = $expiry
     strike          = $strike
-    optionType      = if ($optionType)      { "$optionType".Trim().ToUpper() }      else { "" }
-    lotSize         = $lotSize
-    tickSize        = $tickSize
-    isin            = $isin
+    optionType      = $optType
+    lotSize         = $lot
+    raw = [pscustomobject]@{
+      exch_id   = $exch
+      segment   = $segment
+      trade_sym = $tradingSym
+      exch_instr= $exchInstr
+    }
   }
 }
 
 function Import-DhanCsv {
   param([string]$Path = $T18_CsvPath)
   if (-not (Test-Path $Path)) {
-    throw "Instruments CSV not found at '$Path'. Place the latest Dhan instruments CSV there."
+    throw "Instruments CSV not found at '$Path'."
   }
   Write-T18Log "Loading instruments CSV: $Path ..."
   $rows = Import-Csv -LiteralPath $Path
-  $norm = foreach ($r in $rows) { Normalize-Row $r }
-  Write-T18Log ("Loaded {0} rows" -f ($norm.Count))
-  return ,$norm
+  $out  = foreach ($r in $rows) { Normalize-Row $r }
+  Write-T18Log ("Loaded {0} rows" -f ($out.Count))
+  return ,$out
 }
 
 function Save-Cache($rows) {
@@ -128,29 +129,27 @@ function Find-T18SecurityId {
   )
 
   $rows = Get-T18InstrumentsCache
+  $sym  = $Symbol.ToUpper()
 
-  $sym = $Symbol.ToUpper()
   $q = $rows | Where-Object {
     $_.exchangeSegment -eq $ExchangeSegment -and
     ( $_.symbol -eq $sym -or $_.underlying -eq $sym )
   }
 
-  # For cash: do NOT require instrument; prefer EQ series if present
   if ($ExchangeSegment -in @('NSE','BSE')) {
     $eq = $q | Where-Object { $_.series -eq 'EQ' }
     if ($eq -and $eq.Count -gt 0) { $q = $eq }
-    # If user gave an Instrument hint, keep it but make it tolerant
     if ($Instrument) {
       $ins = $Instrument.ToUpper()
       $q = $q | Where-Object { $_.instrument -eq $ins -or [string]::IsNullOrWhiteSpace($_.instrument) }
     }
   }
 
-  # For F&O, apply Expiry/Strike/OptionType filters
   function _NormDate([string]$d) {
     if ([string]::IsNullOrWhiteSpace($d)) { return '' }
     try { ([datetime]::Parse($d, [Globalization.CultureInfo]::InvariantCulture)).ToString('yyyy-MM-dd') } catch { $d }
   }
+
   if ($ExchangeSegment -eq 'NSE_FNO') {
     if ($Instrument) {
       $ins = $Instrument.ToUpper()
@@ -169,7 +168,7 @@ function Find-T18SecurityId {
     }
   }
 
-  $list = $q | Select-Object securityId,symbol,exchangeSegment,instrument,series,underlying,expiry,strike,optionType,lotSize,isin -Unique
+  $list = $q | Select-Object securityId,symbol,exchangeSegment,instrument,series,underlying,expiry,strike,optionType,lotSize,raw -Unique
 
   if (-not $list -or $list.Count -eq 0) {
     throw "No instrument found for Symbol='$Symbol', Segment='$ExchangeSegment' with the provided filters."
