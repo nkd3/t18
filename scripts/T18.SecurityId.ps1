@@ -1,4 +1,4 @@
-﻿# C:\T18\scripts\T18.SecurityId.ps1
+﻿# OVERWRITE: C:\T18\scripts\T18.SecurityId.ps1
 # T18 — Dhan instruments CSV loader + symbol→securityId mapper + dhBody builders (Windows-native, PowerShell 5.1)
 
 Set-StrictMode -Version Latest
@@ -31,6 +31,18 @@ function Get-FirstDefined {
   return $Default
 }
 
+function Map-Exchange([string]$raw) {
+  if ([string]::IsNullOrWhiteSpace($raw)) { return "" }
+  $v = $raw.Trim().ToUpper()
+  switch -Regex ($v) {
+    '^NSE[_\-]?EQ$'   { return 'NSE' }
+    '^BSE[_\-]?EQ$'   { return 'BSE' }
+    '^(NSEFO|NSE[_\-]?FNO)$' { return 'NSE_FNO' }
+    '^(NSE|BSE)$'     { return $v }
+    default           { return $v }  # leave unknowns as-is
+  }
+}
+
 function Normalize-Row($row) {
   $map = @{}
   foreach ($p in $row.PSObject.Properties) {
@@ -40,7 +52,7 @@ function Normalize-Row($row) {
 
   $securityId      = Get-FirstDefined -Map $map -Keys @('securityid','security_id','secid')
   $symbol          = Get-FirstDefined -Map $map -Keys @('symbol','trading_symbol','scrip')
-  $exchangeSegment = Get-FirstDefined -Map $map -Keys @('exchangesegment','exchange_segment','exchange')
+  $exchangeRaw     = Get-FirstDefined -Map $map -Keys @('exchangesegment','exchange_segment','exchange')
   $instrument      = Get-FirstDefined -Map $map -Keys @('instrument','instrument_type','inst_type')
   $series          = Get-FirstDefined -Map $map -Keys @('series','segment_series')
   $underlying      = Get-FirstDefined -Map $map -Keys @('underlying','underlying_symbol')
@@ -57,7 +69,7 @@ function Normalize-Row($row) {
   [pscustomobject]@{
     securityId      = $securityId
     symbol          = if ($symbol)          { "$symbol".Trim().ToUpper() }          else { "" }
-    exchangeSegment = if ($exchangeSegment) { "$exchangeSegment".Trim().ToUpper() } else { "" }
+    exchangeSegment = Map-Exchange $exchangeRaw
     instrument      = if ($instrument)      { "$instrument".Trim().ToUpper() }      else { "" }
     series          = if ($series)          { "$series".Trim().ToUpper() }          else { "" }
     underlying      = if ($underlying)      { "$underlying".Trim().ToUpper() }      else { "" }
@@ -123,22 +135,27 @@ function Find-T18SecurityId {
     ( $_.symbol -eq $sym -or $_.underlying -eq $sym )
   }
 
-  if ($Instrument) {
-    $ins = $Instrument.ToUpper()
-    $q = $q | Where-Object { $_.instrument -eq $ins }
-  }
-
+  # For cash: do NOT require instrument; prefer EQ series if present
   if ($ExchangeSegment -in @('NSE','BSE')) {
-    $hasEQ = $q | Where-Object { $_.series -eq 'EQ' }
-    if ($hasEQ -and $hasEQ.Count -gt 0) { $q = $hasEQ }
+    $eq = $q | Where-Object { $_.series -eq 'EQ' }
+    if ($eq -and $eq.Count -gt 0) { $q = $eq }
+    # If user gave an Instrument hint, keep it but make it tolerant
+    if ($Instrument) {
+      $ins = $Instrument.ToUpper()
+      $q = $q | Where-Object { $_.instrument -eq $ins -or [string]::IsNullOrWhiteSpace($_.instrument) }
+    }
   }
 
+  # For F&O, apply Expiry/Strike/OptionType filters
   function _NormDate([string]$d) {
     if ([string]::IsNullOrWhiteSpace($d)) { return '' }
     try { ([datetime]::Parse($d, [Globalization.CultureInfo]::InvariantCulture)).ToString('yyyy-MM-dd') } catch { $d }
   }
-
   if ($ExchangeSegment -eq 'NSE_FNO') {
+    if ($Instrument) {
+      $ins = $Instrument.ToUpper()
+      $q = $q | Where-Object { $_.instrument -eq $ins }
+    }
     if ($Expiry) {
       $normExp = _NormDate $Expiry
       $q = $q | Where-Object { (_NormDate $_.expiry) -eq $normExp }
